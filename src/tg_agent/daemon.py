@@ -26,6 +26,7 @@ import traceback
 from types import SimpleNamespace
 
 from telethon import events, functions, types, utils
+from telethon.errors import FloodWaitError
 
 from .core import (
     CATCH_UP_LIMIT,
@@ -58,6 +59,14 @@ def log(*a) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
 
 
+def describe(e: BaseException) -> str:
+    if isinstance(e, FloodWaitError):
+        return f"Telegram просит подождать {e.seconds}с"
+    if isinstance(e, TimeoutError):
+        return "Telegram не ответил вовремя"
+    return f"{type(e).__name__}: {e}"
+
+
 def send(w: asyncio.StreamWriter, **msg) -> None:
     w.write((json.dumps(msg, ensure_ascii=False) + "\n").encode())
 
@@ -71,6 +80,7 @@ class Subscriber:
         self.titles: dict[int, str] = {}
         self.lock = asyncio.Lock()
         self.dead = False
+        self.live = False  # до конца догонки push этому подписчику не шлём: догонка — с «(пропущено)»
 
 
 class Daemon:
@@ -92,11 +102,24 @@ class Daemon:
             else:
                 self.client.add_event_handler(self.on_new, events.NewMessage())
                 log("connected to Telegram")
+                self.dc_task = asyncio.create_task(self.watch_disconnect())  # ссылка: иначе GC
         except Exception as e:  # noqa: BLE001 — любая ошибка подключения = понятный ответ клиентам
             self.fatal = f"не удалось подключиться к Telegram: {type(e).__name__}: {e} — исправь и tg stop"
         if self.fatal:
             log("FATAL", self.fatal)
         self.ready.set()
+
+    async def watch_disconnect(self) -> None:
+        """Telethon отключается насовсем при отзыве сессии / фатальной ошибке обновлений (не при обрыве
+        сети — тут он переподключается сам). Без этого демон — живой труп с «переподключается»."""
+        await self.client.disconnected
+        if self.stop.is_set():
+            return
+        self.fatal = "Telegram отключил клиента (сессия отозвана?) — tg login, затем tg stop"
+        log("FATAL", self.fatal)
+        for s in list(self.subs):
+            send(s.w, err=self.fatal, rc=1)
+            self.kill(s, "fatal")
 
     async def wait_ready(self, timeout: float | None) -> None:
         if not self.ready.is_set():
@@ -125,6 +148,9 @@ class Daemon:
             for i, m in enumerate(sorted(msgs, key=lambda m: m.id), 1):
                 send(sub.w, msg=prefix + fmt(m, sub.titles[pid]), pid=pid, id=m.id)
                 sub.sent[pid] = m.id
+                if isinstance(getattr(m, "action", None), types.MessageActionChatMigrateTo):
+                    send(sub.w, out=f"tg-watch: «{sub.titles[pid]}» стал супергруппой — сюда больше не пишут; "
+                                     f"подпишись на -100{m.action.channel_id}")
                 if i % DRAIN_EVERY == 0 and not await self.flush(sub):
                     return
             if len(msgs) == CATCH_UP_LIMIT:
@@ -151,7 +177,7 @@ class Daemon:
 
     async def on_new(self, event) -> None:
         pid = event.chat_id
-        for sub in [s for s in self.subs if pid in s.sent]:
+        for sub in [s for s in self.subs if pid in s.sent and s.live]:
             try:
                 await self.deliver(sub, pid)
             except Exception as e:  # noqa: BLE001 — push-обработчик не должен падать; догонит опрос
@@ -164,7 +190,10 @@ class Daemon:
             peers = [await self.client.get_input_entity(p) for p in pids]
             res = await asyncio.wait_for(
                 self.client(functions.messages.GetPeerDialogsRequest(peers=peers)), RPC_TIMEOUT)
-            return {utils.get_peer_id(d.peer): d.top_message for d in res.dialogs}
+            got = {utils.get_peer_id(d.peer): d.top_message for d in res.dialogs}
+            # чата нет в ответе — вышли/выгнали/удалён: это ошибка, а не «ничего нового»
+            return {p: got.get(p, LookupError("чата нет в ответе Telegram — вышли, выгнали или удалён"))
+                    for p in pids}
         except Exception:  # noqa: BLE001 — разберёмся по одному
             out: dict[int, int | Exception] = {}
             for p in pids:
@@ -172,7 +201,8 @@ class Daemon:
                     peer = await self.client.get_input_entity(p)
                     res = await asyncio.wait_for(
                         self.client(functions.messages.GetPeerDialogsRequest(peers=[peer])), RPC_TIMEOUT)
-                    out[p] = res.dialogs[0].top_message if res.dialogs else 0
+                    out[p] = res.dialogs[0].top_message if res.dialogs else \
+                        LookupError("чата нет в ответе Telegram — вышли, выгнали или удалён")
                 except Exception as e:  # noqa: BLE001
                     out[p] = e
             return out
@@ -181,7 +211,7 @@ class Daemon:
         failing: set[int] = set()  # чаты, по которым подписчики уже знают об ошибке опроса
         while True:
             await asyncio.sleep(POLL)
-            subs = [s for s in self.subs if s.sent]
+            subs = [s for s in self.subs if s.sent and s.live]
             pids = sorted({p for s in subs for p in s.sent})
             if not pids:
                 continue
@@ -191,7 +221,7 @@ class Daemon:
                 if not ok and p not in failing:
                     e = top[p]
                     log("poll error", p, type(e).__name__, e)
-                    self.notify(p, f"tg-watch: ошибка опроса ({type(e).__name__}: {e}) — продолжаю пробовать")
+                    self.notify(p, f"tg-watch: ошибка опроса «{p}» ({describe(e)}) — продолжаю пробовать")
                     failing.add(p)
                 elif ok and p in failing:
                     self.notify(p, "tg-watch: опрос снова работает")
@@ -225,8 +255,17 @@ class Daemon:
                  + f"; push + страховочный опрос раз в {POLL}с (демон pid {os.getpid()})")
             await self.flush(sub)
             log("watch +", list(sub.titles))
-            for pid in catch_up:
-                await self.deliver(sub, pid, prefix="(пропущено) ")
+            for pid in catch_up:  # сломанный чат (выгнали, флуд) не должен ронять подписку на остальные
+                try:
+                    await self.deliver(sub, pid, prefix="(пропущено) ")
+                except Exception as e:  # noqa: BLE001
+                    log("catch-up error", pid, type(e).__name__, e)
+                    send(w, out=f"tg-watch: «{sub.titles[pid]}» пропускаю ({describe(e)}) — "
+                                "остальные чаты под наблюдением")
+                    sub.sent.pop(pid, None)
+            sub.live = True
+            for pid in list(sub.sent):  # что пришло, пока шла догонка
+                await self.deliver(sub, pid)
             while await reader.read(1024):  # до отключения клиента (Monitor истёк, TaskStop)
                 pass
         except TimeoutError as e:
@@ -290,7 +329,17 @@ class Daemon:
         if a.after and len(msgs) == a.limit:
             out(f"… показаны первые {a.limit} после #{a.after}; дальше: --after {msgs[-1].id}")
 
+    def transport_up(self) -> bool:
+        # is_connected() остаётся True и во время переподключения; транспорт — честнее.
+        # _sender — приватный API Telethon 1.x.
+        sender = getattr(self.client, "_sender", None)
+        return sender._transport_connected() if sender else self.client.is_connected()
+
     async def op_send(self, a, out) -> None:
+        if a.as_me and not self.transport_up():
+            # Без связи запрос встал бы в очередь Telethon и ушёл после переподключения — даже если
+            # команда уже отвалилась по таймауту и агент отправил повторно. Отказываем сразу.
+            raise TgError("нет связи с Telegram — не отправляю (иначе сообщение может уйти позже вторым)")
         if a.as_me:
             entity = await resolve(self.client, a.chat, fuzzy=False)
             m = await self.client.send_message(entity, a.text, reply_to=a.reply_to)
@@ -318,11 +367,7 @@ class Daemon:
         elif not self.ready.is_set():
             conn = "подключается…"
         else:
-            # is_connected() остаётся True и во время переподключения; транспорт — честнее.
-            # _sender — приватный API Telethon 1.x.
-            sender = getattr(self.client, "_sender", None)
-            live = sender._transport_connected() if sender else self.client.is_connected()
-            conn = "да" if live else "нет (переподключается)"
+            conn = "да" if self.transport_up() else "нет (переподключается)"
         out(f"демон: pid {os.getpid()}, работает {up // 3600}ч {up % 3600 // 60}м, подключён к Telegram: {conn}")
         if not self.subs:
             out("подписок нет")
@@ -354,7 +399,12 @@ class Daemon:
             try:
                 await asyncio.wait_for(op(a, lambda s: send(w, out=s)), OP_TIMEOUT)
             except TimeoutError as e:
+                if cmd == "send":
+                    raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — СТАТУС НЕИЗВЕСТЕН: сообщение могло "
+                                  "уйти или уйдёт позже. Не повторяй — проверь tg read") from e
                 raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — нет связи? (tg status)") from e
+            except FloodWaitError as e:
+                raise TgError(describe(e)) from e
             send(w, rc=0)
         except TgError as e:
             send(w, err=str(e), rc=1)

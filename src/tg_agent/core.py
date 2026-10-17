@@ -14,7 +14,7 @@ from pathlib import Path
 
 import keyring
 from telethon import TelegramClient, utils
-from telethon.errors import RPCError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 
@@ -70,7 +70,9 @@ def store(name: str, value: str) -> None:
 # ---------- клиент и чаты ----------
 
 def make_client(session: str | None = None, *, daemon: bool = False) -> TelegramClient:
-    kw = {"connection_retries": -1, "retry_delay": 5, "auto_reconnect": True} if daemon else {}
+    # Демон: переподключаться бесконечно; на FloodWait не спать молча дольше 5с — сказать клиенту.
+    kw = {"connection_retries": -1, "retry_delay": 5, "auto_reconnect": True,
+          "flood_sleep_threshold": 5} if daemon else {}
     return TelegramClient(
         StringSession(session if session is not None else secret("session")),
         int(secret("api_id")),
@@ -121,6 +123,8 @@ async def resolve(client: TelegramClient, query: str, *, fuzzy: bool):
             # а он у Telegram жёстко ограничен по частоте
             inp = await client.get_input_entity(int(q) if is_numeric_id(q) else q)
             return await client.get_entity(inp)
+        except FloodWaitError:
+            raise  # не «не найден»: Telegram просит подождать — пусть это и увидят
         except (ValueError, RPCError):
             pass  # нет в кэше / нет такого username — поищем среди своих диалогов, но только точно
     needle = q.lstrip("@").casefold() if q.startswith("@") else q.casefold()
@@ -180,10 +184,17 @@ def fmt(msg: Message, chat: str | None = None) -> str:
     parts.append(("[я]" if msg.out else sender_name(msg)) + ":")
     if msg.reply_to_msg_id:
         parts.append(f"↩#{msg.reply_to_msg_id}")
+    if getattr(msg, "action", None) is not None:  # вступление, закреп, смена названия, миграция…
+        parts[-1] = parts[-1].replace("↩", "→")  # у закрепа reply_to — закреплённое сообщение
+        kind = type(msg.action).__name__.removeprefix("MessageAction")
+        parts.append(f"[служебное: {kind}]")
+        return " ".join(parts)
     text = msg.message or ""
     if msg.media:
         kind = type(msg.media).__name__.removeprefix("MessageMedia")
         text = f"[{kind}] {text}".strip()
+    if getattr(msg, "fwd_from", None):
+        text = f"[переслано] {text}"
     parts.append(clean(text))
     return " ".join(parts)
 
@@ -208,7 +219,13 @@ def bot_api(token: str, method: str, payload: dict | None = None) -> dict:
     except json.JSONDecodeError as e:
         raise TgError(f"Bot API {method}: неожиданный ответ ({body[:200]!r})") from e
     if not data.get("ok"):
-        raise TgError(f"Bot API {method}: {data.get('description')}")
+        extra = data.get("parameters") or {}
+        hint = ""
+        if "retry_after" in extra:
+            hint = f" — Telegram просит подождать {extra['retry_after']}с"
+        if "migrate_to_chat_id" in extra:
+            hint = f" — группа стала супергруппой, новый id {extra['migrate_to_chat_id']}"
+        raise TgError(f"Bot API {method}: {data.get('description')}{hint}")
     return data["result"]
 
 
