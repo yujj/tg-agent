@@ -31,6 +31,7 @@ from .core import (
     SPAWN_LOCK,
     TgError,
     bot_api,
+    check_sock_path,
     ensure_state_dir,
     load_wm,
     make_client,
@@ -48,6 +49,7 @@ DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch", "status"}
 # ---------- связь с демоном ----------
 
 def connect() -> socket.socket | None:
+    check_sock_path()
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.connect(str(SOCK))

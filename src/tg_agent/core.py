@@ -28,6 +28,12 @@ class TgError(Exception):
     pass
 
 
+def check_sock_path() -> None:
+    # sockaddr_un.sun_path: 104 байта на macOS, 108 на Linux
+    if len(str(SOCK).encode()) > 100:
+        raise TgError(f"путь к сокету слишком длинный ({SOCK}) — задай короче TG_AGENT_STATE")
+
+
 def ensure_state_dir() -> None:
     """Каталог состояния — только для владельца. chmod — только на свой каталог по умолчанию или на
     только что созданный: TG_AGENT_STATE=~ не должен закрыть домашний каталог."""
