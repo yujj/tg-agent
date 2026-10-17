@@ -1,0 +1,27 @@
+[project]
+name = "tg-agent"
+version = "0.1.0"
+description = "Telegram для агента: читать чаты от аккаунта, писать от бота"
+readme = "README.md"
+authors = [
+    { name = "yujj" }
+]
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["telegram", "claude-code", "agent", "telethon"]
+
+dependencies = [
+    "keyring>=25.7.0",
+    "telethon>=1.45.0",
+]
+
+[project.urls]
+Repository = "https://github.com/yujj/tg-agent"
+
+[project.scripts]
+tg = "tg_agent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
