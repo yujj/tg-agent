@@ -25,11 +25,12 @@ import time
 import traceback
 from types import SimpleNamespace
 
-from telethon import events, functions, utils
+from telethon import events, functions, types, utils
 
 from .core import (
     CATCH_UP_LIMIT,
     DAEMON_LOCK,
+    DAEMON_LOG,
     SOCK,
     TgError,
     bot_api,
@@ -45,6 +46,9 @@ from .core import (
 POLL = 60  # страховочный опрос, секунд: один GetPeerDialogs на все подписанные чаты
 RPC_TIMEOUT = 30  # один запрос к Telegram дольше — считаем сбоем, не держим подписку
 READY_TIMEOUT = 20  # сколько разовая команда ждёт подключения к Telegram
+OP_TIMEOUT = 60  # разовая команда / старт подписки целиком: при обрыве связи Telethon ждёт бесконечно
+DRAIN_TIMEOUT = 10  # подписчик не забрал данные за столько — он завис, отключаем
+DRAIN_EVERY = 20  # при догонке сбрасывать буфер каждые N сообщений
 MAX_BUFFER = 1_000_000  # подписчик не читает и накопил столько — отключаем
 LINE_LIMIT = 1_000_000  # максимальная длина JSON-строки запроса
 EXIT_ALREADY_RUNNING = 3
@@ -84,12 +88,12 @@ class Daemon:
         try:
             await self.client.connect()  # без сети ждёт сколько нужно (connection_retries=-1)
             if not await self.client.is_user_authorized():
-                self.fatal = "сессия недействительна — tg login"
+                self.fatal = "сессия недействительна или Telegram не ответил — tg login, затем tg stop"
             else:
                 self.client.add_event_handler(self.on_new, events.NewMessage())
                 log("connected to Telegram")
         except Exception as e:  # noqa: BLE001 — любая ошибка подключения = понятный ответ клиентам
-            self.fatal = f"не удалось подключиться к Telegram: {type(e).__name__}: {e}"
+            self.fatal = f"не удалось подключиться к Telegram: {type(e).__name__}: {e} — исправь и tg stop"
         if self.fatal:
             log("FATAL", self.fatal)
         self.ready.set()
@@ -99,8 +103,7 @@ class Daemon:
             try:
                 await asyncio.wait_for(self.ready.wait(), timeout)
             except TimeoutError as e:
-                raise TgError("нет связи с Telegram — демон подключается; проверь сеть/VPN "
-                              "и ~/.local/state/tg-agent/daemon.log") from e
+                raise TgError(f"нет связи с Telegram — демон подключается; проверь сеть/VPN и {DAEMON_LOG}") from e
         if self.fatal:
             raise TgError(self.fatal)
 
@@ -115,19 +118,33 @@ class Daemon:
         async with sub.lock:
             if sub.dead or pid not in sub.sent:
                 return
+            if sub.w.transport.get_write_buffer_size() > MAX_BUFFER:  # прошлое так и не забрал
+                self.kill(sub, "не читает")
+                return
             msgs = await asyncio.wait_for(self._fetch(pid, sub.sent[pid]), RPC_TIMEOUT)
-            for m in sorted(msgs, key=lambda m: m.id):
+            for i, m in enumerate(sorted(msgs, key=lambda m: m.id), 1):
                 send(sub.w, msg=prefix + fmt(m, sub.titles[pid], compact=True), pid=pid, id=m.id)
                 sub.sent[pid] = m.id
+                if i % DRAIN_EVERY == 0 and not await self.flush(sub):
+                    return
             if len(msgs) == CATCH_UP_LIMIT:
                 send(sub.w, out=f"«{sub.titles[pid]}»: новых больше {CATCH_UP_LIMIT}, показаны "
                                  "последние — остальное: tg read")
-            if sub.w.transport.get_write_buffer_size() > MAX_BUFFER:
-                log("subscriber not reading — dropped")
-                self.drop(sub)
-                sub.w.close()
-                return
-            await sub.w.drain()
+            await self.flush(sub)
+
+    async def flush(self, sub: Subscriber) -> bool:
+        """drain с таймаутом: зависший подписчик не должен держать свой замок, а с ним — опрос."""
+        try:
+            await asyncio.wait_for(sub.w.drain(), DRAIN_TIMEOUT)
+            return True
+        except (TimeoutError, ConnectionError) as e:
+            self.kill(sub, type(e).__name__)
+            return False
+
+    def kill(self, sub: Subscriber, why: str) -> None:
+        log("subscriber dropped:", why)
+        self.drop(sub)
+        sub.w.close()
 
     async def _fetch(self, pid: int, after: int) -> list:
         return [m async for m in self.client.iter_messages(pid, min_id=after, limit=CATCH_UP_LIMIT)]
@@ -140,34 +157,59 @@ class Daemon:
             except Exception as e:  # noqa: BLE001 — push-обработчик не должен падать; догонит опрос
                 log("push deliver error", pid, type(e).__name__, e)
 
+    async def top_messages(self, pids: list[int]) -> dict[int, int | Exception]:
+        """Последний id по каждому чату. Пакетно; не вышло — по одному, чтобы один сломанный чат
+        (выгнали из канала) не выключал опрос для остальных."""
+        try:
+            peers = [await self.client.get_input_entity(p) for p in pids]
+            res = await asyncio.wait_for(
+                self.client(functions.messages.GetPeerDialogsRequest(peers=peers)), RPC_TIMEOUT)
+            return {utils.get_peer_id(d.peer): d.top_message for d in res.dialogs}
+        except Exception:  # noqa: BLE001 — разберёмся по одному
+            out: dict[int, int | Exception] = {}
+            for p in pids:
+                try:
+                    peer = await self.client.get_input_entity(p)
+                    res = await asyncio.wait_for(
+                        self.client(functions.messages.GetPeerDialogsRequest(peers=[peer])), RPC_TIMEOUT)
+                    out[p] = res.dialogs[0].top_message if res.dialogs else 0
+                except Exception as e:  # noqa: BLE001
+                    out[p] = e
+            return out
+
     async def poll_loop(self) -> None:
-        failing = False
+        failing: set[int] = set()  # чаты, по которым подписчики уже знают об ошибке опроса
         while True:
             await asyncio.sleep(POLL)
             subs = [s for s in self.subs if s.sent]
             pids = sorted({p for s in subs for p in s.sent})
             if not pids:
                 continue
-            try:
-                peers = [await self.client.get_input_entity(p) for p in pids]
-                res = await asyncio.wait_for(
-                    self.client(functions.messages.GetPeerDialogsRequest(peers=peers)), RPC_TIMEOUT)
-                top = {utils.get_peer_id(d.peer): d.top_message for d in res.dialogs}
-                for s in subs:
-                    for p, last in list(s.sent.items()):
-                        if top.get(p, 0) > last:
-                            log("poll caught", p, top[p])
+            top = await self.top_messages(pids)
+            for p in pids:
+                ok = not isinstance(top.get(p), Exception)
+                if not ok and p not in failing:
+                    e = top[p]
+                    log("poll error", p, type(e).__name__, e)
+                    self.notify(p, f"tg-watch: ошибка опроса ({type(e).__name__}: {e}) — продолжаю пробовать")
+                    failing.add(p)
+                elif ok and p in failing:
+                    self.notify(p, "tg-watch: опрос снова работает")
+                    failing.discard(p)
+            for s in subs:
+                for p, last in list(s.sent.items()):
+                    t = top.get(p)
+                    if isinstance(t, int) and t > last:
+                        log("poll caught", p, t)
+                        try:
                             await self.deliver(s, p)
-                if failing:
-                    for s in subs:
-                        send(s.w, out="tg-watch: опрос снова работает")
-                failing = False
-            except Exception as e:  # noqa: BLE001 — опрос — страховка, он не имеет права умереть
-                log("poll error", type(e).__name__, e)
-                if not failing:
-                    for s in subs:
-                        send(s.w, out=f"tg-watch: ошибка опроса ({type(e).__name__}: {e}) — продолжаю пробовать")
-                failing = True
+                        except Exception as e:  # noqa: BLE001 — сбой одного подписчика не трогает других
+                            log("poll deliver error", p, type(e).__name__, e)
+
+    def notify(self, pid: int, line: str) -> None:
+        for s in self.subs:
+            if pid in s.sent and not s.dead:
+                send(s.w, out=line)
 
     async def watch(self, a, reader: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         if not self.ready.is_set():
@@ -176,37 +218,47 @@ class Daemon:
         await self.wait_ready(None)
         since = {int(k): v for k, v in (a.since or {}).items()}
         sub = Subscriber(w)
-        catch_up = []
-        for q in a.chats:
-            e = await resolve(self.client, q, fuzzy=True)
-            pid = utils.get_peer_id(e)
-            sub.titles[pid] = chat_title(e)
-            if since.get(pid) is None:  # первая подписка на чат — с текущего момента
-                latest = await self.client.get_messages(pid, limit=1)
-                sub.sent[pid] = latest[0].id if latest else 0
-                send(w, init=pid, id=sub.sent[pid])
-            else:
-                sub.sent[pid] = since[pid]
-                catch_up.append(pid)
-        self.subs.add(sub)
+        self.subs.add(sub)  # сразу: push по уже готовому чату не должен проскочить, пока готовятся остальные
         try:
-            for pid in catch_up:
-                await self.deliver(sub, pid, prefix="(пропущено) ")
+            catch_up = await asyncio.wait_for(self.watch_setup(sub, a.chats, since), OP_TIMEOUT)
             send(w, out="tg-watch started: " + ", ".join(f"«{t}» ({p})" for p, t in sub.titles.items())
                  + f"; push + страховочный опрос раз в {POLL}с (демон pid {os.getpid()})")
-            await w.drain()
+            await self.flush(sub)
             log("watch +", list(sub.titles))
+            for pid in catch_up:
+                await self.deliver(sub, pid, prefix="(пропущено) ")
             while await reader.read(1024):  # до отключения клиента (Monitor истёк, TaskStop)
                 pass
+        except TimeoutError as e:
+            raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — нет связи? Перезапусти подписку") from e
         finally:
             self.drop(sub)
             log("watch -", list(sub.titles))
+
+    async def watch_setup(self, sub: Subscriber, chats: list[str], since: dict[int, int]) -> list[int]:
+        catch_up = []
+        for q in chats:
+            e = await resolve(self.client, q, fuzzy=True)
+            pid = utils.get_peer_id(e)
+            if pid in sub.titles:
+                continue  # тот же чат, указанный по-разному
+            sub.titles[pid] = chat_title(e)
+            async with sub.lock:
+                if since.get(pid) is None:  # первая подписка на чат — с текущего момента
+                    latest = await self.client.get_messages(pid, limit=1)
+                    sub.sent[pid] = latest[0].id if latest else 0
+                    send(sub.w, init=pid, id=sub.sent[pid])
+                else:
+                    sub.sent[pid] = since[pid]
+                    catch_up.append(pid)
+        return catch_up
 
     # ----- разовые команды -----
 
     async def op_whoami(self, a, out) -> None:
         me = await self.client.get_me()
-        out(f"аккаунт: {utils.get_display_name(me)} (@{me.username}) id={me.id}")
+        uname = f" (@{me.username})" if me.username else ""
+        out(f"аккаунт: {utils.get_display_name(me)}{uname} id={me.id}")
         try:
             bot = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "getMe"))
             out("бот: @" + bot["username"])
@@ -253,7 +305,7 @@ class Daemon:
         if a.reply_to:
             # Номера сообщений у аккаунта и бота совпадают только в каналах и супергруппах (-100…);
             # в обычных группах и личке у каждого своя нумерация — ответ ушёл бы не туда.
-            if not str(chat_id).startswith("-100"):
+            if utils.resolve_id(chat_id)[1] is not types.PeerChannel:
                 raise TgError("--reply-to ботом — только в каналах и супергруппах (id -100…)")
             payload["reply_parameters"] = {"message_id": a.reply_to}
         res = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "sendMessage", payload))
@@ -266,7 +318,11 @@ class Daemon:
         elif not self.ready.is_set():
             conn = "подключается…"
         else:
-            conn = "да" if self.client.is_connected() else "нет (переподключается)"
+            # is_connected() остаётся True и во время переподключения; транспорт — честнее.
+            # _sender — приватный API Telethon 1.x.
+            sender = getattr(self.client, "_sender", None)
+            live = sender._transport_connected() if sender else self.client.is_connected()
+            conn = "да" if live else "нет (переподключается)"
         out(f"демон: pid {os.getpid()}, работает {up // 3600}ч {up % 3600 // 60}м, подключён к Telegram: {conn}")
         if not self.subs:
             out("подписок нет")
@@ -295,7 +351,10 @@ class Daemon:
                 raise TgError(f"неизвестная команда {cmd}")
             if cmd not in ("status", "shutdown"):
                 await self.wait_ready(READY_TIMEOUT)
-            await op(a, lambda s: send(w, out=s))
+            try:
+                await asyncio.wait_for(op(a, lambda s: send(w, out=s)), OP_TIMEOUT)
+            except TimeoutError as e:
+                raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — нет связи? (tg status)") from e
             send(w, rc=0)
         except TgError as e:
             send(w, err=str(e), rc=1)
@@ -332,12 +391,13 @@ class Daemon:
 
 def run_daemon() -> None:
     ensure_state_dir()
-    lock = open(DAEMON_LOCK, "w")  # noqa: SIM115 — держим открытым всю жизнь демона
+    lock = open(DAEMON_LOCK, "a+")  # noqa: SIM115 — держим открытым всю жизнь демона; "a+" не стирает pid соседа
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         log("другой демон уже работает — выхожу")
         raise SystemExit(EXIT_ALREADY_RUNNING) from None
+    lock.truncate(0)
     lock.write(str(os.getpid()))
     lock.flush()
     asyncio.run(Daemon().run())

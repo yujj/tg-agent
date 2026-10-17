@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import keyring
 from telethon import TelegramClient, utils
+from telethon.errors import RPCError
 from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 
@@ -88,7 +91,7 @@ def parse_query(query: str) -> tuple[str, bool]:
     q = query.strip()
     m = LINK.match(q)
     if m:
-        parts = m.group(1).split("/")
+        parts = re.split(r"[?#]", m.group(1), maxsplit=1)[0].split("/")
         if parts[0] in ("joinchat",) or parts[0].startswith("+"):
             raise TgError("инвайт-ссылки не поддерживаются — открой чат и дай его id (tg chats)")
         if parts[0] == "c" and len(parts) > 1 and parts[1].isdigit():
@@ -108,9 +111,12 @@ async def resolve(client: TelegramClient, query: str, *, fuzzy: bool):
     q, explicit = parse_query(query)
     if explicit:
         try:
-            return await client.get_entity(int(q) if is_numeric_id(q) else q)
-        except ValueError:
-            pass  # нет в кэше сущностей — поищем среди своих диалогов, но только точно
+            # get_input_entity берёт из кэша; get_entity("@x") каждый раз ходит в ResolveUsername,
+            # а он у Telegram жёстко ограничен по частоте
+            inp = await client.get_input_entity(int(q) if is_numeric_id(q) else q)
+            return await client.get_entity(inp)
+        except (ValueError, RPCError):
+            pass  # нет в кэше / нет такого username — поищем среди своих диалогов, но только точно
     needle = q.lstrip("@").casefold() if q.startswith("@") else q.casefold()
     exact, partial = [], []
     async for d in client.iter_dialogs():
@@ -192,14 +198,34 @@ def wm_path(key: str) -> Path:
 
 
 def load_wm(path: Path) -> dict[str, int]:
+    """Метки подписчика. Повреждённый файл — TgError: молча начинать «с текущего момента» нельзя,
+    это потеря всего пропущенного."""
     try:
-        return json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
         return {}
+    except (json.JSONDecodeError, OSError) as e:
+        raise TgError(f"файл меток {path} повреждён ({e})") from e
+    if not isinstance(data, dict) or not all(is_numeric_id(k) and isinstance(v, int) for k, v in data.items()):
+        raise TgError(f"файл меток {path} повреждён (неожиданный формат)")
+    return data
 
 
-def save_wm(path: Path, wm: dict[str, int]) -> None:
+def save_wm(path: Path, updates: dict[str, int]) -> None:
+    """Слить метки в файл: под блокировкой перечитать, взять максимум по каждому чату, записать
+    атомарно. Несколько tg watch с одним --key не затирают метки друг друга."""
     ensure_state_dir()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(wm, indent=1))
-    tmp.replace(path)
+    with open(path.with_name(path.name + ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            cur = load_wm(path)
+        except TgError:
+            cur = {}  # повреждённый перезаписываем свежими данными
+        for k, v in updates.items():
+            cur[k] = max(cur.get(k, v), v)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(cur, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)

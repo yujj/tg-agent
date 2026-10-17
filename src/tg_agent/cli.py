@@ -25,6 +25,7 @@ import keyring
 from telethon import utils
 
 from .core import (
+    DAEMON_LOCK,
     DAEMON_LOG,
     SERVICE,
     SOCK,
@@ -40,10 +41,11 @@ from .core import (
     wm_path,
 )
 
-EXIT_ALREADY_RUNNING = 3  # = daemon.EXIT_ALREADY_RUNNING: другой демон уже стартует — ждём его сокет
+EXIT_ALREADY_RUNNING = 3  # = daemon.EXIT_ALREADY_RUNNING: блокировку держит другой демон
+CALL_TIMEOUT = 90  # разовая команда: демон сам обрывает свои запросы на 60с, это — страховка
 MAX_TEXT = 4096  # лимит Telegram на одно сообщение
 
-DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch", "status"}
+DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch"}
 
 
 # ---------- связь с демоном ----------
@@ -66,6 +68,31 @@ def log_tail(n: int = 5) -> str:
         return "(лога нет)"
 
 
+def lock_free(timeout: float) -> bool:
+    """Дождаться, пока демон отпустит блокировку (остановка ещё идёт: disconnect от Telegram)."""
+    deadline = time.time() + timeout
+    with open(DAEMON_LOCK, "a") as f:
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f, fcntl.LOCK_UN)
+                return True
+            except BlockingIOError:
+                if time.time() > deadline:
+                    return False
+                time.sleep(0.2)
+
+
+def spawn() -> subprocess.Popen:
+    if DAEMON_LOG.exists() and DAEMON_LOG.stat().st_size > 5_000_000:
+        DAEMON_LOG.rename(DAEMON_LOG.with_suffix(".log.1"))
+    with open(DAEMON_LOG, "a") as logf:
+        return subprocess.Popen(
+            [sys.executable, "-m", "tg_agent", "daemon"],
+            stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True,
+        )
+
+
 def ensure_daemon() -> socket.socket:
     s = connect()
     if s:
@@ -76,20 +103,20 @@ def ensure_daemon() -> socket.socket:
         s = connect()
         if s:
             return s
-        if DAEMON_LOG.exists() and DAEMON_LOG.stat().st_size > 5_000_000:
-            DAEMON_LOG.rename(DAEMON_LOG.with_suffix(".log.1"))
-        with open(DAEMON_LOG, "a") as logf:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tg_agent", "daemon"],
-                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True,
-            )
+        proc = spawn()
         deadline = time.time() + 30
         while time.time() < deadline:
             s = connect()
             if s:
                 return s
-            if proc.poll() not in (None, EXIT_ALREADY_RUNNING):
-                raise TgError(f"демон не запустился (код {proc.returncode}). {DAEMON_LOG}:\n{log_tail()}")
+            rc = proc.poll()
+            if rc == EXIT_ALREADY_RUNNING:
+                # блокировку держит уходящий демон (tg stop только что) — дождаться и поднять заново
+                if not lock_free(15):
+                    raise TgError(f"блокировку держит другой процесс демона и сокета нет. {DAEMON_LOG}:\n{log_tail()}")
+                proc = spawn()
+            elif rc is not None:
+                raise TgError(f"демон не запустился (код {rc}). {DAEMON_LOG}:\n{log_tail()}")
             time.sleep(0.2)
         raise TgError(f"демон не ответил за 30с. {DAEMON_LOG}:\n{log_tail()}")
 
@@ -98,26 +125,34 @@ def call(cmd: str, args: dict, *, sock: socket.socket | None = None, wm_file: Pa
     """Запрос к демону. Для watch (wm_file задан) — печатать сообщения и сдвигать метки ПОСЛЕ печати."""
     s = sock or ensure_daemon()
     err_out = sys.stdout if wm_file else sys.stderr  # для Monitor ошибка должна быть событием
-    wm = load_wm(wm_file) if wm_file else {}
     if wm_file:
+        try:
+            wm = load_wm(wm_file)
+        except TgError as e:
+            print(f"tg-watch: {e} — чаты стартуют с текущего момента, пропущенное смотри tg read", flush=True)
+            wm = {}
         args = {**args, "since": wm}
+    else:
+        s.settimeout(CALL_TIMEOUT)
     s.sendall((json.dumps({"cmd": cmd, "args": args}, ensure_ascii=False) + "\n").encode())
     with s, s.makefile("r", encoding="utf-8") as f:
-        for line in f:
-            msg = json.loads(line)
-            if "out" in msg:
-                print(msg["out"], flush=True)
-            if "msg" in msg:
-                print(msg["msg"], flush=True)
-                wm[str(msg["pid"])] = max(wm.get(str(msg["pid"]), 0), msg["id"])
-                save_wm(wm_file, wm)
-            if "init" in msg:
-                wm.setdefault(str(msg["init"]), msg["id"])
-                save_wm(wm_file, wm)
-            if "err" in msg:
-                print(f"tg: {msg['err']}", file=err_out, flush=True)
-            if "rc" in msg:
-                return msg["rc"]
+        try:
+            for line in f:
+                msg = json.loads(line)
+                if "out" in msg:
+                    print(msg["out"], flush=True)
+                if "msg" in msg:
+                    print(msg["msg"], flush=True)
+                    save_wm(wm_file, {str(msg["pid"]): msg["id"]})
+                if "init" in msg:
+                    save_wm(wm_file, {str(msg["init"]): msg["id"]})
+                if "err" in msg:
+                    print(f"tg: {msg['err']}", file=err_out, flush=True)
+                if "rc" in msg:
+                    return msg["rc"]
+        except TimeoutError:
+            print(f"tg: демон не ответил за {CALL_TIMEOUT}с (tg status)", file=err_out, flush=True)
+            return 1
     print("tg: демон закрыл соединение (остановлен или упал) — перезапусти команду, демон поднимется заново",
           file=err_out, flush=True)
     return 1
@@ -128,7 +163,18 @@ def cmd_stop(args) -> int:
     if not s:
         print("демон не запущен")
         return 0
-    return call("shutdown", {}, sock=s)
+    rc = call("shutdown", {}, sock=s)
+    if rc == 0 and not lock_free(15):  # следующая команда должна поднять новый демон без ожидания
+        print("демон ещё завершается (держит блокировку дольше 15с)")
+    return rc
+
+
+def cmd_status(args) -> int:
+    s = connect()  # статус не поднимает демон — только показывает
+    if not s:
+        print("демон не запущен (поднимется сам при первой команде)")
+        return 0
+    return call("status", {}, sock=s)
 
 
 # ---------- настройка (локально, интерактивно) ----------
@@ -225,12 +271,17 @@ def main() -> None:
             rc = call(args.cmd, payload, wm_file=wm_path(args.key) if args.cmd == "watch" else None)
         else:
             handler = {"setup-api": cmd_setup_api, "setup-bot": cmd_setup_bot,
-                       "login": cmd_login, "stop": cmd_stop,
+                       "login": cmd_login, "stop": cmd_stop, "status": cmd_status,
                        "install-skill": cmd_install_skill}[args.cmd]
             res = handler(args)
             rc = asyncio.run(res) if asyncio.iscoroutine(res) else res
     except TgError as e:
         print(f"tg: {e}", file=sys.stdout if args.cmd == "watch" else sys.stderr)
+        rc = 1
+    except Exception as e:  # для Monitor любая поломка watch должна быть строкой в stdout
+        if args.cmd != "watch":
+            raise
+        print(f"tg: {type(e).__name__}: {e} — перезапусти подписку", flush=True)
         rc = 1
     except KeyboardInterrupt:
         rc = 130
