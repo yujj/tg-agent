@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import tempfile
 import urllib.error
 import urllib.request
@@ -34,16 +35,21 @@ class TgError(Exception):
 def check_sock_path() -> None:
     # sockaddr_un.sun_path: 104 байта на macOS, 108 на Linux
     if len(str(SOCK).encode()) > 100:
-        raise TgError(f"путь к сокету слишком длинный ({SOCK}) — задай короче TG_AGENT_STATE")
+        raise TgError(f"путь к сокету слишком длинный ({SOCK}) — задай короче TG_AGENT_STATE (свой каталог, не /tmp)")
 
 
 def ensure_state_dir() -> None:
     """Каталог состояния — только для владельца. chmod — только на свой каталог по умолчанию или на
-    только что созданный: TG_AGENT_STATE=~ не должен закрыть домашний каталог."""
+    только что созданный: TG_AGENT_STATE=~ не должен закрыть домашний каталог. Чужой, общий или
+    симлинк — отказ: там сокет, лог и метки, а в общем каталоге (/tmp) их подсунет другой пользователь."""
     created = not STATE_DIR.exists()
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     if created or STATE_DIR == DEFAULT_STATE_DIR:
         STATE_DIR.chmod(0o700)
+    st = os.lstat(STATE_DIR)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise TgError(f"каталог {STATE_DIR} — симлинк, чужой или доступен другим (нужен свой, 700); "
+                      "TG_AGENT_STATE — только в свой каталог (на macOS подойдёт $TMPDIR)")
 
 
 # ---------- секреты ----------
@@ -137,31 +143,48 @@ async def resolve(client: TelegramClient, query: str, *, fuzzy: bool):
     raise TgError(f"«{query}» подходит к нескольким чатам, уточни id:\n{lines}")
 
 
+# Всё, что пишут в чат (текст, имена, названия), контролирует посторонний, а вывод читает LLM-агент.
+# Поэтому: одно сообщение = одна строка (иначе текст рисует поддельные строки «#id я: …» или
+# «tg-watch started»), управляющие и bidi-символы — видимыми escape-последовательностями
+# (терминал, ANSI, подмена порядка), а «своё» сообщение помечается так, как текстом не подделать.
+LINE_BREAKS = re.compile(r"\r\n|[\r\n\u2028\u2029\u0085\v\f]")
+UNSAFE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]")
+
+
+def clean(s: str | None) -> str:
+    s = LINE_BREAKS.sub(" ⏎ ", s or "")
+    return UNSAFE.sub(lambda m: f"\\u{ord(m.group()):04x}", s)
+
+
 def sender_name(msg: Message) -> str:
+    """Имя — не доказательство: его выбирает сам отправитель. Поэтому всегда с id."""
     s = msg.sender
+    sid = msg.sender_id
     if s is None:
-        return chat_title(msg.chat) if msg.chat else "?"
-    name = utils.get_display_name(s)
-    uname = getattr(s, "username", None)
-    return f"{name} (@{uname})" if uname else name
+        name = chat_title(msg.chat) if msg.chat else "?"
+    else:
+        name = utils.get_display_name(s)
+        uname = getattr(s, "username", None)
+        if uname:
+            name += f" @{uname}"
+    return f"{clean(name)} (id {sid})"
 
 
-def fmt(msg: Message, chat: str | None = None, compact: bool = False) -> str:
+def fmt(msg: Message, chat: str | None = None) -> str:
     ts = msg.date.astimezone().strftime("%Y-%m-%d %H:%M")
     parts = [f"[{ts}]"]
     if chat:
-        parts.append(f"«{chat}»")
+        parts.append(f"«{clean(chat)}»")
     parts.append(f"#{msg.id}")
-    parts.append(("я" if msg.out else sender_name(msg)) + ":")
+    # [я] ставит код по msg.out; текст и имя чужого сообщения в квадратные скобки сюда не попадут
+    parts.append(("[я]" if msg.out else sender_name(msg)) + ":")
     if msg.reply_to_msg_id:
         parts.append(f"↩#{msg.reply_to_msg_id}")
     text = msg.message or ""
     if msg.media:
         kind = type(msg.media).__name__.removeprefix("MessageMedia")
         text = f"[{kind}] {text}".strip()
-    if compact:
-        text = text.replace("\n", " ⏎ ")
-    parts.append(text)
+    parts.append(clean(text))
     return " ".join(parts)
 
 

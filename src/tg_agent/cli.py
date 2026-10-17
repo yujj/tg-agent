@@ -30,6 +30,7 @@ from .core import (
     SERVICE,
     SOCK,
     SPAWN_LOCK,
+    STATE_DIR,
     TgError,
     bot_api,
     check_sock_path,
@@ -87,9 +88,11 @@ def spawn() -> subprocess.Popen:
     if DAEMON_LOG.exists() and DAEMON_LOG.stat().st_size > 5_000_000:
         DAEMON_LOG.rename(DAEMON_LOG.with_suffix(".log.1"))
     with open(DAEMON_LOG, "a") as logf:
+        # -I и cwd: python -m кладёт текущий каталог в начало sys.path, и json.py / keyring.py из
+        # чужого репо, где запущен агент, выполнились бы в демоне — с доступом к сессии аккаунта.
         return subprocess.Popen(
-            [sys.executable, "-m", "tg_agent", "daemon"],
-            stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True,
+            [sys.executable, "-I", "-m", "tg_agent", "daemon"],
+            cwd=STATE_DIR, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True,
         )
 
 

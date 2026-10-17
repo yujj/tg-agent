@@ -123,7 +123,7 @@ class Daemon:
                 return
             msgs = await asyncio.wait_for(self._fetch(pid, sub.sent[pid]), RPC_TIMEOUT)
             for i, m in enumerate(sorted(msgs, key=lambda m: m.id), 1):
-                send(sub.w, msg=prefix + fmt(m, sub.titles[pid], compact=True), pid=pid, id=m.id)
+                send(sub.w, msg=prefix + fmt(m, sub.titles[pid]), pid=pid, id=m.id)
                 sub.sent[pid] = m.id
                 if i % DRAIN_EVERY == 0 and not await self.flush(sub):
                     return
