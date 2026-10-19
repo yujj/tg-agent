@@ -357,7 +357,19 @@ class Daemon:
             if utils.resolve_id(chat_id)[1] is not types.PeerChannel:
                 raise TgError("--reply-to ботом — только в каналах и супергруппах (id -100…)")
             payload["reply_parameters"] = {"message_id": a.reply_to}
-        res = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "sendMessage", payload))
+        try:
+            res = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "sendMessage", payload))
+        except TgError as e:
+            # Bot API знает только сообщения, которые бот получил. С privacy mode (по умолчанию) в группе
+            # это его собственные, ответы ему, команды и упоминания; чужие для него не существуют.
+            if a.reply_to and "message to be replied not found" in str(e):
+                raise TgError(
+                    f"бот не видит #{a.reply_to} в «{title}»: такого нет, или у бота privacy mode, и в группе ему "
+                    "видны только свои сообщения, ответы ему и упоминания. Отвечать на любые — сделать бота админом чата "
+                    "(права не нужны) или выключить privacy в @BotFather (/setprivacy) и перезайти ботом в чат. "
+                    "Ничего не отправлено"
+                ) from e
+            raise
         out(f"отправлено ботом в «{title}»: #{res['message_id']}")
 
     async def op_status(self, a, out) -> None:
