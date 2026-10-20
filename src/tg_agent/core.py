@@ -10,6 +10,7 @@ import stat
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import keyring
@@ -192,7 +193,9 @@ def fmt(msg: Message, chat: str | None = None) -> str:
     text = msg.message or ""
     if msg.media:
         kind = type(msg.media).__name__.removeprefix("MessageMedia")
-        text = f"[{kind}] {text}".strip()
+        name = msg.file.name if msg.file else None  # имя файла выбирает отправитель — это тоже данные
+        text = f"[{kind}: {name}] {text}" if name else f"[{kind}] {text}"
+        text = text.strip()
     if getattr(msg, "fwd_from", None):
         text = f"[переслано] {text}"
     parts.append(clean(text))
@@ -207,8 +210,35 @@ def bot_api(token: str, method: str, payload: dict | None = None) -> dict:
         data=json.dumps(payload or {}).encode(),
         headers={"Content-Type": "application/json"},
     )
+    return _bot_call(req, method, timeout=30)
+
+
+def bot_upload(token: str, method: str, fields: dict, file_field: str, path: Path) -> dict:
+    """Bot API с файлом: multipart/form-data. Вложенные поля (reply_parameters) — JSON-строкой."""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        value = v if isinstance(v, str) else json.dumps(v)
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{value}\r\n'.encode())
+    # Часть знаков (например «—») Bot API в имени файла заменяет пробелами сам; filename* не помогает.
+    name = path.name.replace('"', "")
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n".encode()
+        + path.read_bytes() + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    return _bot_call(req, method, timeout=55)  # загрузка дольше, но в пределах OP_TIMEOUT демона
+
+
+def _bot_call(req: urllib.request.Request, method: str, *, timeout: float) -> dict:
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
     except urllib.error.HTTPError as e:
         body = e.read()

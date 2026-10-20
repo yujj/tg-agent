@@ -45,6 +45,8 @@ from .core import (
 EXIT_ALREADY_RUNNING = 3  # = daemon.EXIT_ALREADY_RUNNING: блокировку держит другой демон
 CALL_TIMEOUT = 90  # разовая команда: демон сам обрывает свои запросы на 60с, это — страховка
 MAX_TEXT = 4096  # лимит Telegram на одно сообщение
+MAX_CAPTION = 1024  # лимит подписи к файлу
+MAX_FILE = 50 * 1024 * 1024  # лимит Bot API на загрузку
 
 DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch"}
 
@@ -252,7 +254,8 @@ def main() -> None:
                    help="своя метка «прочитано» для параллельного подписчика (по умолчанию default)")
     p = sub.add_parser("send", help="написать (по умолчанию от бота)")
     p.add_argument("chat")
-    p.add_argument("text", help="текст или - (из stdin)")
+    p.add_argument("text", nargs="?", default="", help="текст или - (из stdin); с --file — подпись, можно без неё")
+    p.add_argument("--file", help="приложить файл (документом)")
     p.add_argument("--as-me", action="store_true", help="от аккаунта пользователя — только по его явной просьбе")
     p.add_argument("--reply-to", type=int)
     args = ap.parse_args()
@@ -267,7 +270,17 @@ def main() -> None:
             if args.cmd == "send":
                 if args.text == "-":
                     payload["text"] = sys.stdin.read()
-                if not payload["text"].strip():
+                if args.file:
+                    # Демон живёт в другом каталоге — путь абсолютный, и проверяем здесь, чтобы ошибка была понятной.
+                    path = Path(args.file).expanduser().resolve()
+                    if not path.is_file():
+                        raise TgError(f"нет такого файла: {path}")
+                    if path.stat().st_size > MAX_FILE:
+                        raise TgError(f"файл больше {MAX_FILE // 2**20} МБ — Bot API такой не примет")
+                    payload["file"] = str(path)
+                    if len(payload["text"]) > MAX_CAPTION:
+                        raise TgError(f"подпись к файлу длиннее {MAX_CAPTION} символов — отправь текст отдельным сообщением")
+                elif not payload["text"].strip():
                     raise TgError("пустой текст")
                 if len(payload["text"]) > MAX_TEXT:
                     raise TgError(f"текст длиннее {MAX_TEXT} символов — раздели на несколько сообщений")

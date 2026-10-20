@@ -23,6 +23,7 @@ import os
 import signal
 import time
 import traceback
+from pathlib import Path
 from types import SimpleNamespace
 
 from telethon import events, functions, types, utils
@@ -35,6 +36,7 @@ from .core import (
     SOCK,
     TgError,
     bot_api,
+    bot_upload,
     chat_title,
     ensure_state_dir,
     fmt,
@@ -340,17 +342,25 @@ class Daemon:
             # Без связи запрос встал бы в очередь Telethon и ушёл после переподключения — даже если
             # команда уже отвалилась по таймауту и агент отправил повторно. Отказываем сразу.
             raise TgError("нет связи с Telegram — не отправляю (иначе сообщение может уйти позже вторым)")
+        file = getattr(a, "file", None)
+        what = f" (файл {Path(file).name})" if file else ""
         if a.as_me:
             entity = await resolve(self.client, a.chat, fuzzy=False)
-            m = await self.client.send_message(entity, a.text, reply_to=a.reply_to)
-            out(f"отправлено от аккаунта в «{chat_title(entity)}»: #{m.id}")
+            if file:
+                m = await self.client.send_file(entity, file, caption=a.text or None, reply_to=a.reply_to,
+                                                force_document=True)
+            else:
+                m = await self.client.send_message(entity, a.text, reply_to=a.reply_to)
+            out(f"отправлено от аккаунта в «{chat_title(entity)}»: #{m.id}{what}")
             return
         if is_numeric_id(a.chat):
             chat_id, title = int(a.chat), a.chat
         else:
             entity = await resolve(self.client, a.chat, fuzzy=False)
             chat_id, title = utils.get_peer_id(entity), chat_title(entity)
-        payload = {"chat_id": chat_id, "text": a.text}
+        payload = {"chat_id": chat_id}
+        if a.text:
+            payload["caption" if file else "text"] = a.text
         if a.reply_to:
             # Номера сообщений у аккаунта и бота совпадают только в каналах и супергруппах (-100…);
             # в обычных группах и личке у каждого своя нумерация — ответ ушёл бы не туда.
@@ -358,7 +368,11 @@ class Daemon:
                 raise TgError("--reply-to ботом — только в каналах и супергруппах (id -100…)")
             payload["reply_parameters"] = {"message_id": a.reply_to}
         try:
-            res = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "sendMessage", payload))
+            if file:
+                res = await asyncio.to_thread(
+                    lambda: bot_upload(secret("bot_token"), "sendDocument", payload, "document", Path(file)))
+            else:
+                res = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "sendMessage", payload))
         except TgError as e:
             # Bot API знает только сообщения, которые бот получил. С privacy mode (по умолчанию) в группе
             # это его собственные, ответы ему, команды и упоминания; чужие для него не существуют.
@@ -370,7 +384,7 @@ class Daemon:
                     "Ничего не отправлено"
                 ) from e
             raise
-        out(f"отправлено ботом в «{title}»: #{res['message_id']}")
+        out(f"отправлено ботом в «{title}»: #{res['message_id']}{what}")
 
     async def op_status(self, a, out) -> None:
         up = int(time.time() - self.started)
