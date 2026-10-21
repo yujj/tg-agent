@@ -27,6 +27,7 @@ from telethon import utils
 from .core import (
     DAEMON_LOCK,
     DAEMON_LOG,
+    DOWNLOAD_TIMEOUT,
     SERVICE,
     SOCK,
     SPAWN_LOCK,
@@ -48,7 +49,7 @@ MAX_TEXT = 4096  # лимит Telegram на одно сообщение
 MAX_CAPTION = 1024  # лимит подписи к файлу
 MAX_FILE = 50 * 1024 * 1024  # лимит Bot API на загрузку
 
-DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch"}
+DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch", "download"}
 
 
 # ---------- связь с демоном ----------
@@ -128,6 +129,7 @@ def ensure_daemon() -> socket.socket:
 
 def call(cmd: str, args: dict, *, sock: socket.socket | None = None, wm_file: Path | None = None) -> int:
     """Запрос к демону. Для watch (wm_file задан) — печатать сообщения и сдвигать метки ПОСЛЕ печати."""
+    timeout = DOWNLOAD_TIMEOUT + 30 if cmd == "download" else CALL_TIMEOUT
     s = sock or ensure_daemon()
     err_out = sys.stdout if wm_file else sys.stderr  # для Monitor ошибка должна быть событием
     if wm_file:
@@ -138,7 +140,7 @@ def call(cmd: str, args: dict, *, sock: socket.socket | None = None, wm_file: Pa
             wm = {}
         args = {**args, "since": wm}
     else:
-        s.settimeout(CALL_TIMEOUT)
+        s.settimeout(timeout)
     s.sendall((json.dumps({"cmd": cmd, "args": args}, ensure_ascii=False) + "\n").encode())
     with s, s.makefile("r", encoding="utf-8") as f:
         try:
@@ -156,7 +158,7 @@ def call(cmd: str, args: dict, *, sock: socket.socket | None = None, wm_file: Pa
                 if "rc" in msg:
                     return msg["rc"]
         except TimeoutError:
-            print(f"tg: демон не ответил за {CALL_TIMEOUT}с (tg status)", file=err_out, flush=True)
+            print(f"tg: демон не ответил за {timeout}с (tg status)", file=err_out, flush=True)
             return 1
     print("tg: демон закрыл соединение (остановлен или упал) — перезапусти команду, демон поднимется заново",
           file=err_out, flush=True)
@@ -258,6 +260,10 @@ def main() -> None:
     p.add_argument("--file", help="приложить файл (документом)")
     p.add_argument("--as-me", action="store_true", help="от аккаунта пользователя — только по его явной просьбе")
     p.add_argument("--reply-to", type=int)
+    p = sub.add_parser("download", help="скачать файл из сообщения (голосовое, документ, фото), печатает путь")
+    p.add_argument("chat", help="@username, t.me-ссылка, id или часть названия")
+    p.add_argument("msg_id", type=int, help="#id сообщения из tg read")
+    p.add_argument("--out", default=".", help="каталог для файла (по умолчанию текущий)")
     args = ap.parse_args()
 
     try:
@@ -284,6 +290,12 @@ def main() -> None:
                     raise TgError("пустой текст")
                 if len(payload["text"]) > MAX_TEXT:
                     raise TgError(f"текст длиннее {MAX_TEXT} символов — раздели на несколько сообщений")
+            if args.cmd == "download":
+                # Демон живёт в другом каталоге — путь абсолютный, и проверяем здесь, чтобы ошибка была понятной.
+                out_dir = Path(args.out).expanduser().resolve()
+                if not out_dir.is_dir():
+                    raise TgError(f"нет такого каталога: {out_dir}")
+                payload["out"] = str(out_dir)
             rc = call(args.cmd, payload, wm_file=wm_path(args.key) if args.cmd == "watch" else None)
         else:
             handler = {"setup-api": cmd_setup_api, "setup-bot": cmd_setup_bot,

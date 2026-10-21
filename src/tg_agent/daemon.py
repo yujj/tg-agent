@@ -33,6 +33,7 @@ from .core import (
     CATCH_UP_LIMIT,
     DAEMON_LOCK,
     DAEMON_LOG,
+    DOWNLOAD_TIMEOUT,
     SOCK,
     TgError,
     bot_api,
@@ -42,6 +43,7 @@ from .core import (
     fmt,
     is_numeric_id,
     make_client,
+    media_filename,
     resolve,
     secret,
 )
@@ -386,6 +388,23 @@ class Daemon:
             raise
         out(f"отправлено ботом в «{title}»: #{res['message_id']}{what}")
 
+    async def op_download(self, a, out) -> None:
+        entity = await resolve(self.client, a.chat, fuzzy=True)
+        m = await self.client.get_messages(entity, ids=a.msg_id)
+        if m is None:
+            raise TgError(f"нет сообщения #{a.msg_id} в «{chat_title(entity)}»")
+        if not m.file:
+            raise TgError(f"в #{a.msg_id} нет файла для скачивания")
+        dest = Path(a.out) / media_filename(m)
+        part = dest.with_name(dest.name + ".part")  # оборвалось — недокачанный файл не выдаём за целый
+        try:
+            await self.client.download_media(m, file=str(part))
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        part.replace(dest)
+        out(str(dest))
+
     async def op_status(self, a, out) -> None:
         up = int(time.time() - self.started)
         if self.fatal:
@@ -422,13 +441,14 @@ class Daemon:
                 raise TgError(f"неизвестная команда {cmd}")
             if cmd not in ("status", "shutdown"):
                 await self.wait_ready(READY_TIMEOUT)
+            timeout = DOWNLOAD_TIMEOUT if cmd == "download" else OP_TIMEOUT
             try:
-                await asyncio.wait_for(op(a, lambda s: send(w, out=s)), OP_TIMEOUT)
+                await asyncio.wait_for(op(a, lambda s: send(w, out=s)), timeout)
             except TimeoutError as e:
                 if cmd == "send":
                     raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — СТАТУС НЕИЗВЕСТЕН: сообщение могло "
                                   "уйти или уйдёт позже. Не повторяй — проверь tg read") from e
-                raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — нет связи? (tg status)") from e
+                raise TgError(f"Telegram не ответил за {timeout}с — нет связи? (tg status)") from e
             except FloodWaitError as e:
                 raise TgError(describe(e)) from e
             send(w, rc=0)

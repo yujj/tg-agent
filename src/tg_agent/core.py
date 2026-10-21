@@ -27,6 +27,7 @@ DAEMON_LOG = STATE_DIR / "daemon.log"
 DAEMON_LOCK = STATE_DIR / "tgd.lock"
 SPAWN_LOCK = STATE_DIR / "spawn.lock"
 CATCH_UP_LIMIT = 200  # больше пропущенного за раз не выдаём — иначе залп в чат агента
+DOWNLOAD_TIMEOUT = 300  # скачать файл — дольше обычной команды (OP_TIMEOUT демона)
 
 
 class TgError(Exception):
@@ -194,12 +195,27 @@ def fmt(msg: Message, chat: str | None = None) -> str:
     if msg.media:
         kind = type(msg.media).__name__.removeprefix("MessageMedia")
         name = msg.file.name if msg.file else None  # имя файла выбирает отправитель — это тоже данные
-        text = f"[{kind}: {name}] {text}" if name else f"[{kind}] {text}"
+        if msg.voice:  # голосовое — без имени, а длительность подсказывает, что его стоит скачать
+            d = int(msg.file.duration or 0)
+            text = f"[Voice {d // 60}:{d % 60:02}] {text}"
+        else:
+            text = f"[{kind}: {name}] {text}" if name else f"[{kind}] {text}"
         text = text.strip()
     if getattr(msg, "fwd_from", None):
         text = f"[переслано] {text}"
     parts.append(clean(text))
     return " ".join(parts)
+
+
+def media_filename(msg: Message) -> str:
+    """Имя для скачанного файла: <чат>_<id>_<имя>. Имя выбирает отправитель — от него остаются только
+    безопасные знаки, без каталогов; нет имени — по типу (voice.oga, photo.jpg)."""
+    name = Path(msg.file.name or "").name if msg.file else ""
+    name = re.sub(r"[^\w.-]+", "_", name).strip("._")[:100]
+    if not name:
+        kind = "voice" if msg.voice else "video_note" if msg.video_note else "photo" if msg.photo else "file"
+        name = kind + (msg.file.ext if msg.file and msg.file.ext else "")
+    return f"{abs(msg.chat_id)}_{msg.id}_{name}"
 
 
 # ---------- Bot API ----------
