@@ -49,7 +49,7 @@ MAX_TEXT = 4096  # лимит Telegram на одно сообщение
 MAX_CAPTION = 1024  # лимит подписи к файлу
 MAX_FILE = 50 * 1024 * 1024  # лимит Bot API на загрузку
 
-DAEMON_CMDS = {"whoami", "chats", "read", "send", "watch", "download"}
+DAEMON_CMDS = {"whoami", "chats", "read", "send", "react", "watch", "download"}
 
 
 # ---------- связь с демоном ----------
@@ -260,6 +260,11 @@ def main() -> None:
     p.add_argument("--file", help="приложить файл (документом)")
     p.add_argument("--as-me", action="store_true", help="от аккаунта пользователя — только по его явной просьбе")
     p.add_argument("--reply-to", type=int)
+    p = sub.add_parser("react", help="поставить реакцию на сообщение (по умолчанию от бота)")
+    p.add_argument("chat")
+    p.add_argument("msg_id", type=int, help="#id сообщения из tg read")
+    p.add_argument("emoji", help="эмодзи из списка реакций Telegram: 👌 👍 ❤ 🔥 …")
+    p.add_argument("--as-me", action="store_true", help="от аккаунта пользователя — только по его явной просьбе")
     p = sub.add_parser("download", help="скачать файл из сообщения (голосовое, документ, фото), печатает путь")
     p.add_argument("chat", help="@username, t.me-ссылка, id или часть названия")
     p.add_argument("msg_id", type=int, help="#id сообщения из tg read")

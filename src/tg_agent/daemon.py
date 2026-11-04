@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from telethon import events, functions, types, utils
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 
 from .core import (
     CATCH_UP_LIMIT,
@@ -387,6 +387,36 @@ class Daemon:
                 ) from e
             raise
         out(f"отправлено ботом в «{title}»: #{res['message_id']}{what}")
+
+    async def op_react(self, a, out) -> None:
+        if a.as_me:
+            entity = await resolve(self.client, a.chat, fuzzy=False)
+            try:
+                await self.client(functions.messages.SendReactionRequest(
+                    peer=entity, msg_id=a.msg_id, reaction=[types.ReactionEmoji(emoticon=a.emoji)]))
+            except FloodWaitError:
+                raise
+            except RPCError as e:  # REACTION_INVALID, MESSAGE_ID_INVALID — текст Telegram как есть
+                raise TgError(f"Telegram не принял реакцию {a.emoji} на #{a.msg_id}: {e.message}") from e
+            out(f"реакция {a.emoji} от аккаунта на #{a.msg_id} в «{chat_title(entity)}»")
+            return
+        if is_numeric_id(a.chat):
+            chat_id, title = int(a.chat), a.chat
+        else:
+            entity = await resolve(self.client, a.chat, fuzzy=False)
+            chat_id, title = utils.get_peer_id(entity), chat_title(entity)
+        # Как с --reply-to: номера сообщений у аккаунта и бота совпадают только в каналах и супергруппах.
+        if utils.resolve_id(chat_id)[1] is not types.PeerChannel:
+            raise TgError("реакция ботом — только в каналах и супергруппах (id -100…)")
+        payload = {"chat_id": chat_id, "message_id": a.msg_id,
+                   "reaction": [{"type": "emoji", "emoji": a.emoji}]}
+        try:
+            await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "setMessageReaction", payload))
+        except TgError as e:
+            if "REACTION_INVALID" in str(e):
+                raise TgError(f"{e} — {a.emoji} нет в списке реакций Telegram или в этом чате он выключен") from e
+            raise
+        out(f"реакция {a.emoji} на #{a.msg_id} в «{title}»")
 
     async def op_download(self, a, out) -> None:
         entity = await resolve(self.client, a.chat, fuzzy=True)
