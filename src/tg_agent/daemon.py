@@ -350,7 +350,7 @@ class Daemon:
             entity = await resolve(self.client, a.chat, fuzzy=False)
             if file:
                 m = await self.client.send_file(entity, file, caption=a.text or None, reply_to=a.reply_to,
-                                                force_document=True)
+                                                force_document=not getattr(a, "photo", False))
             else:
                 m = await self.client.send_message(entity, a.text, reply_to=a.reply_to)
             out(f"отправлено от аккаунта в «{chat_title(entity)}»: #{m.id}{what}")
@@ -371,8 +371,9 @@ class Daemon:
             payload["reply_parameters"] = {"message_id": a.reply_to}
         try:
             if file:
+                method, field = ("sendPhoto", "photo") if getattr(a, "photo", False) else ("sendDocument", "document")
                 res = await asyncio.to_thread(
-                    lambda: bot_upload(secret("bot_token"), "sendDocument", payload, "document", Path(file)))
+                    lambda: bot_upload(secret("bot_token"), method, payload, field, Path(file)))
             else:
                 res = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "sendMessage", payload))
         except TgError as e:

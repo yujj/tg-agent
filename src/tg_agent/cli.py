@@ -258,6 +258,7 @@ def main() -> None:
     p.add_argument("chat")
     p.add_argument("text", nargs="?", default="", help="текст или - (из stdin); с --file — подпись, можно без неё")
     p.add_argument("--file", help="приложить файл (документом)")
+    p.add_argument("--photo", action="store_true", help="с --file: картинку отправить фото, а не документом")
     p.add_argument("--as-me", action="store_true", help="от аккаунта пользователя — только по его явной просьбе")
     p.add_argument("--reply-to", type=int)
     p = sub.add_parser("react", help="поставить реакцию на сообщение (по умолчанию от бота)")
