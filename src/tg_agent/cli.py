@@ -218,16 +218,27 @@ def cmd_setup_bot(args) -> int:
     return 0
 
 
+SKILL_FILES = (
+    "SKILL.md",
+    ".claude-plugin/plugin.json",
+    "hooks/hooks.json",
+    "hooks/register.ts",
+    "types/index.d.ts",
+)
+
+
 def cmd_install_skill(args) -> int:
-    """Скопировать скилл Claude Code из пакета. После обновления tg — запустить снова."""
+    """Скопировать скилл и плагин Claude Code из пакета. После обновления tg — запустить снова."""
     target = Path(args.dir).expanduser() / "telegram"
     if target.is_symlink():
         print(f"{target} — ссылка (установка для разработки), не трогаю")
         return 0
-    target.mkdir(parents=True, exist_ok=True)
-    src = resources.files("tg_agent") / "skill" / "SKILL.md"
-    (target / "SKILL.md").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"скилл установлен: {target / 'SKILL.md'}")
+    root = resources.files("tg_agent") / "skill"
+    for name in SKILL_FILES:
+        dest = target / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text((root / name).read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"скилл и плагин tg установлены: {target}")
     return 0
 
 

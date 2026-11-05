@@ -1,0 +1,6 @@
+{
+  "name": "tg",
+  "version": "0.1.0",
+  "description": "Telegram for Claude Code: the telegram skill, and a watch that wakes the session on new messages with no 30-minute expiry.",
+  "types": "./types/index.d.ts"
+}
