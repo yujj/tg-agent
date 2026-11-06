@@ -11,6 +11,10 @@ import type { EngineInterface, Register } from 'claude-code'
 const CHATS = { plugin: 'tg', key: 'chats' } as const
 const DEFAULTS_FILE = '.claude/tg-watch.local'
 const BATCH_MS = 2000
+// Telegram unreachable this long, awake, before the model hears of it: blips and a wake-up
+// from sleep reconnect within seconds and stay in the debug log.
+const OUTAGE_MS = 5 * 60_000
+const TICK_MS = 30_000
 
 type Watch = { stop: () => void }
 let current: Watch | undefined
@@ -19,6 +23,11 @@ let pending: string[] = []
 let flush: { cancel: () => void } | undefined
 let ownBot: string | undefined
 let key = 'claude'
+// One outage: when it began (awake time), and whether the model was told. Told once per
+// outage, then once more when it ends, so a day without network is two turns, not a stream.
+let downSince: number | undefined
+let told = false
+let ticking = false
 
 const unique = (xs: string[]) => [...new Set(xs.map(x => x.trim()).filter(Boolean))]
 
@@ -45,11 +54,58 @@ function deliver($: EngineInterface, line: string) {
   })
 }
 
+function down($: EngineInterface, line: string) {
+  $.ui.log(line, { to: 'debug' })
+  $.ui.status('tg: no connection to Telegram, retrying')
+  if (downSince !== undefined) return
+  void (async () => {
+    downSince = await $.clock.now()
+    if (!ticking) void tick($)
+  })()
+}
+
+function up($: EngineInterface) {
+  if (told) deliver($, 'tg-watch: connection to Telegram is back; messages missed meanwhile follow as (пропущено)')
+  downSince = undefined
+  told = false
+}
+
+// Counts outage time only while the machine is awake: a tick that comes back much later
+// than asked means the lid was shut, and the count restarts from the wake-up.
+async function tick($: EngineInterface) {
+  ticking = true
+  let last = await $.clock.now()
+  while (downSince !== undefined) {
+    await $.clock.sleep(TICK_MS)
+    const now = await $.clock.now()
+    if (downSince === undefined) break
+    if (now - last > 3 * TICK_MS) downSince = now
+    last = now
+    if (!told && now - downSince >= OUTAGE_MS) {
+      told = true
+      deliver($, `tg-watch: no connection to Telegram for ${Math.round(OUTAGE_MS / 60_000)} min; still retrying, messages are not arriving. Check \`tg status\` and the daemon log; tell the user.`)
+    }
+  }
+  ticking = false
+}
+
 function handle($: EngineInterface, line: string) {
   if (line.startsWith('tg-watch started')) {
+    up($)
     $.ui.status(`tg: ${line.slice('tg-watch started: '.length)}`)
-  } else if (line.startsWith('жду подключения') || line.startsWith('tg-watch: ошибка опроса') || line.startsWith('tg-watch: опрос снова')) {
+  } else if (line.startsWith('tg-watch: опрос снова')) {
     $.ui.log(line, { to: 'debug' })
+    up($)
+    $.ui.status('tg: watching')
+  } else if (
+    line.startsWith('жду подключения') ||
+    line.startsWith('tg-watch: ошибка опроса') ||
+    // the daemon exited (stopped, crashed, or restarted itself when stuck): the loop below restarts the watch
+    line.startsWith('tg: демон закрыл соединение') ||
+    line.startsWith('tg: нет связи с Telegram') ||
+    line.startsWith('tg: Telegram не ответил')
+  ) {
+    down($, line)
   } else if (ownBot && line.includes(ownBot) && !line.startsWith('(пропущено)')) {
     // the bot's own post echoing back
   } else {

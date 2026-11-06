@@ -57,6 +57,8 @@ DRAIN_EVERY = 20  # при догонке сбрасывать буфер каж
 MAX_BUFFER = 1_000_000  # подписчик не читает и накопил столько — отключаем
 LINE_LIMIT = 1_000_000  # максимальная длина JSON-строки запроса
 EXIT_ALREADY_RUNNING = 3
+STUCK_AFTER = 600  # транспорт лежит столько секунд подряд — Telethon завис, перезапускаем демон
+STUCK_CHECK = 30
 
 
 def log(*a) -> None:
@@ -107,6 +109,7 @@ class Daemon:
                 self.client.add_event_handler(self.on_new, events.NewMessage())
                 log("connected to Telegram")
                 self.dc_task = asyncio.create_task(self.watch_disconnect())  # ссылка: иначе GC
+                self.stuck_task = asyncio.create_task(self.watch_stuck())
         except Exception as e:  # noqa: BLE001 — любая ошибка подключения = понятный ответ клиентам
             self.fatal = f"не удалось подключиться к Telegram: {type(e).__name__}: {e} — исправь и tg stop"
         if self.fatal:
@@ -124,6 +127,24 @@ class Daemon:
         for s in list(self.subs):
             send(s.w, err=self.fatal, rc=1)
             self.kill(s, "fatal")
+
+    async def watch_stuck(self) -> None:
+        """После шторма обрывов и 429 (6 Nov) Telethon перестал переподключаться: транспорт лежал 13 ч,
+        а `disconnected` так и не сработал. Транспорт лежит STUCK_AFTER подряд — выходим; подписчики
+        увидят «демон закрыл соединение», следующая команда поднимет новый демон. monotonic на macOS
+        не идёт во сне, так что закрытая крышка не считается. Без сети новый демон ждёт в connect()
+        и сам не выходит: перезапуск — один на сбой."""
+        down_since: float | None = None
+        while not self.stop.is_set():
+            await asyncio.sleep(STUCK_CHECK)
+            if self.transport_up():
+                down_since = None
+            elif down_since is None:
+                down_since = time.monotonic()
+            elif time.monotonic() - down_since >= STUCK_AFTER:
+                log(f"transport down {STUCK_AFTER}s straight — restarting daemon")
+                self.stop.set()
+                return
 
     async def wait_ready(self, timeout: float | None) -> None:
         if not self.ready.is_set():
