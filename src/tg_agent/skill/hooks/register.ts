@@ -99,6 +99,7 @@ function handle($: EngineInterface, line: string) {
     $.ui.status('tg: watching')
   } else if (
     line.startsWith('жду подключения') ||
+    line.startsWith('tg-watch: жду подключения') ||
     line.startsWith('tg-watch: ошибка опроса') ||
     // the daemon exited (stopped, crashed, or restarted itself when stuck): the loop below restarts the watch
     line.startsWith('tg: демон закрыл соединение') ||
