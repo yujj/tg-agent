@@ -440,6 +440,42 @@ class Daemon:
             raise
         out(f"реакция {a.emoji} на #{a.msg_id} в «{title}»")
 
+    async def op_create_group(self, a, out) -> None:
+        # Группу может создать только аккаунт, бот — нет. Как --as-me: только по явной просьбе пользователя.
+        if not self.transport_up():
+            # Как в send --as-me: без связи запрос уйдёт после переподключения, а повтор команды создаст вторую.
+            raise TgError("нет связи с Telegram — не создаю (иначе группа может появиться позже, и не одна)")
+        users = []
+        for q in a.members:
+            # Только точно: @username, id или полное имя — чтобы не добавить в группу не того человека.
+            e = await resolve(self.client, q, fuzzy=False)
+            if not isinstance(e, types.User):
+                raise TgError(f"«{q}» — чат, а не человек: добавить можно только пользователей и ботов")
+            users.append(e)
+        if a.with_bot:
+            bot = await asyncio.to_thread(lambda: bot_api(secret("bot_token"), "getMe"))
+            users.append(await resolve(self.client, "@" + bot["username"], fuzzy=False))
+        # Супергруппа, а не обычная группа: в обычной у бота своя нумерация сообщений, и реакции и
+        # ответы ботом там не работают (см. op_send, op_react).
+        res = await self.client(functions.channels.CreateChannelRequest(title=a.title, about="", megagroup=True))
+        channel = res.chats[0]
+        out(f"создана группа «{chat_title(channel)}»: id {utils.get_peer_id(channel)}")
+        if not users:
+            return
+        try:
+            inv = await self.client(functions.channels.InviteToChannelRequest(channel=channel, users=users))
+        except RPCError as e:  # группа уже есть — повтор команды создал бы вторую
+            raise TgError(f"группа создана, но участников Telegram не добавил: {e.message}. "
+                          "Не повторяй create-group — добавь участников в созданную вручную") from e
+        # Кого не пустили настройки приватности, Telegram перечисляет, а не отказывает целиком.
+        missing = {m.user_id for m in getattr(inv, "missing_invitees", None) or []}
+        for u in users:
+            name = utils.get_display_name(u) + (f" (@{u.username})" if u.username else "")
+            if u.id in missing:
+                out(f"  не добавлен: {name} — запрещено его настройками приватности, пригласи ссылкой")
+            else:
+                out(f"  добавлен: {name}")
+
     async def op_download(self, a, out) -> None:
         entity = await resolve(self.client, a.chat, fuzzy=True)
         m = await self.client.get_messages(entity, ids=a.msg_id)
@@ -500,6 +536,9 @@ class Daemon:
                 if cmd == "send":
                     raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — СТАТУС НЕИЗВЕСТЕН: сообщение могло "
                                   "уйти или уйдёт позже. Не повторяй — проверь tg read") from e
+                if cmd == "create_group":
+                    raise TgError(f"Telegram не ответил за {OP_TIMEOUT}с — СТАТУС НЕИЗВЕСТЕН: группа могла "
+                                  "создаться. Не повторяй — проверь tg chats") from e
                 raise TgError(f"Telegram не ответил за {timeout}с — нет связи? (tg status)") from e
             except FloodWaitError as e:
                 raise TgError(describe(e)) from e

@@ -49,7 +49,7 @@ MAX_TEXT = 4096  # лимит Telegram на одно сообщение
 MAX_CAPTION = 1024  # лимит подписи к файлу
 MAX_FILE = 50 * 1024 * 1024  # лимит Bot API на загрузку
 
-DAEMON_CMDS = {"whoami", "chats", "read", "send", "react", "watch", "download"}
+DAEMON_CMDS = {"whoami", "chats", "read", "send", "react", "watch", "download", "create-group"}
 
 
 # ---------- связь с демоном ----------
@@ -281,6 +281,11 @@ def main() -> None:
     p.add_argument("chat", help="@username, t.me-ссылка, id или часть названия")
     p.add_argument("msg_id", type=int, help="#id сообщения из tg read")
     p.add_argument("--out", default=".", help="каталог для файла (по умолчанию текущий)")
+    p = sub.add_parser("create-group",
+                       help="создать группу от аккаунта и добавить участников — только по явной просьбе пользователя")
+    p.add_argument("title", help="название группы")
+    p.add_argument("members", nargs="*", help="кого добавить: @username, id или полное имя (как в tg chats)")
+    p.add_argument("--with-bot", action="store_true", help="добавить и своего бота — чтобы он мог туда писать")
     args = ap.parse_args()
 
     try:
@@ -313,7 +318,10 @@ def main() -> None:
                 if not out_dir.is_dir():
                     raise TgError(f"нет такого каталога: {out_dir}")
                 payload["out"] = str(out_dir)
-            rc = call(args.cmd, payload, wm_file=wm_path(args.key) if args.cmd == "watch" else None)
+            if args.cmd == "create-group" and not args.title.strip():
+                raise TgError("пустое название группы")
+            # Имя команды демона — имя метода op_<cmd>, дефис там невозможен.
+            rc = call(args.cmd.replace("-", "_"), payload, wm_file=wm_path(args.key) if args.cmd == "watch" else None)
         else:
             handler = {"setup-api": cmd_setup_api, "setup-bot": cmd_setup_bot,
                        "login": cmd_login, "stop": cmd_stop, "status": cmd_status,
