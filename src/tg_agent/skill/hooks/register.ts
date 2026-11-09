@@ -11,9 +11,11 @@ import type { EngineInterface, Register } from 'claude-code'
 const CHATS = { plugin: 'tg', key: 'chats' } as const
 const DEFAULTS_FILE = '.claude/tg-watch.local'
 const BATCH_MS = 2000
-// Telegram unreachable this long, awake, before the model hears of it: blips and a wake-up
-// from sleep reconnect within seconds and stay in the debug log.
-const OUTAGE_MS = 5 * 60_000
+// Telegram unreachable this many minutes, awake, before the model hears of it. Blips, a wake-up
+// from sleep and a Telethon hang (the daemon restarts itself after STUCK_AFTER, 10 min) stay in
+// the debug log; only an outage that outlives all of them is worth interrupting for.
+const OUTAGE_MIN = 20
+const OUTAGE_MS = OUTAGE_MIN * 60_000
 const TICK_MS = 30_000
 
 type Watch = { stop: () => void }
@@ -83,7 +85,7 @@ async function tick($: EngineInterface) {
     last = now
     if (!told && now - downSince >= OUTAGE_MS) {
       told = true
-      deliver($, `tg-watch: no connection to Telegram for ${Math.round(OUTAGE_MS / 60_000)} min; still retrying, messages are not arriving. Check \`tg status\` and the daemon log; tell the user.`)
+      deliver($, `tg-watch: no connection to Telegram for ${OUTAGE_MIN} min; still retrying, messages are not arriving. Check \`tg status\` and the daemon log; tell the user.`)
     }
   }
   ticking = false
