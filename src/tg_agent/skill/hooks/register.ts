@@ -12,7 +12,7 @@ const CHATS = { plugin: 'tg', key: 'chats' } as const
 const DEFAULTS_FILE = '.claude/tg-watch.local'
 const BATCH_MS = 2000
 // Telegram unreachable this many minutes, awake, before the model hears of it. Blips, a wake-up
-// from sleep and a Telethon hang (the daemon restarts itself after STUCK_AFTER, 10 min) stay in
+// from sleep and a Telethon hang (the daemon restarts itself after STUCK_AFTER, 3 min) stay in
 // the debug log; only an outage that outlives all of them is worth interrupting for.
 const OUTAGE_MIN = 20
 const OUTAGE_MS = OUTAGE_MIN * 60_000
