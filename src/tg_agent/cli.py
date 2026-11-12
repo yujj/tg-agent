@@ -220,6 +220,7 @@ def cmd_setup_bot(args) -> int:
 
 SKILL_FILES = (
     "SKILL.md",
+    "references/codex.md",
     ".claude-plugin/plugin.json",
     "hooks/hooks.json",
     "hooks/register.ts",
@@ -250,6 +251,19 @@ def main() -> None:
     sub.add_parser("setup-bot", help="сохранить токен бота (интерактивно)")
     sub.add_parser("whoami", help="проверить аккаунт и бота")
     sub.add_parser("status", help="состояние демона и подписок")
+    for name in ("codex-watch", "codex-unwatch", "codex-watching", "codex-probe", "codex-resolve"):
+        p = sub.add_parser(name, help="подписка и доставка событий в текущий Codex Desktop чат")
+        p.add_argument("--thread-id", help="по умолчанию CODEX_THREAD_ID текущего чата")
+        if name == "codex-watch":
+            p.add_argument("chats", nargs="+", help="точные числовые ID чатов Telegram")
+            p.add_argument("--ignore-sender", type=int, action="append", default=[])
+            p.add_argument("--after", type=int, help="начальная метка для одного чата; не сбрасывает существующую")
+        elif name == "codex-probe":
+            p.add_argument("--deliver", action="store_true", help="проба только в Codex, без поста в Telegram")
+        elif name == "codex-resolve":
+            p.add_argument("event_id")
+            p.add_argument("outcome", choices=["delivered", "retry"])
+            p.add_argument("--reason", required=True)
     sub.add_parser("stop", help="остановить демон")
     p = sub.add_parser("install-skill", help="поставить скилл для Claude Code (~/.claude/skills/telegram)")
     p.add_argument("--dir", default="~/.claude/skills", help="каталог скиллов (по умолчанию ~/.claude/skills)")
@@ -289,6 +303,9 @@ def main() -> None:
     args = ap.parse_args()
 
     try:
+        if args.cmd.startswith("codex-"):
+            from .codex_watch import handle
+            raise SystemExit(handle(args))
         if args.cmd == "daemon":
             from .daemon import run_daemon
             run_daemon()

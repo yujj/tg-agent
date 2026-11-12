@@ -90,6 +90,7 @@ class Subscriber:
         self.lock = asyncio.Lock()
         self.dead = False
         self.live = False  # до конца догонки push этому подписчику не шлём: догонка — с «(пропущено)»
+        self.lossless = False  # Codex сохраняет свою очередь и забирает все страницы, начиная с первых.
 
 
 class Daemon:
@@ -172,19 +173,26 @@ class Daemon:
             if sub.w.transport.get_write_buffer_size() > MAX_BUFFER:  # прошлое так и не забрал
                 self.kill(sub, "не читает")
                 return
-            msgs = await asyncio.wait_for(self._fetch(pid, sub.sent[pid]), RPC_TIMEOUT)
-            for i, m in enumerate(sorted(msgs, key=lambda m: m.id), 1):
-                send(sub.w, msg=prefix + fmt(m, sub.titles[pid]), pid=pid, id=m.id)
-                sub.sent[pid] = m.id
-                if isinstance(getattr(m, "action", None), types.MessageActionChatMigrateTo):
-                    send(sub.w, out=f"tg-watch: «{sub.titles[pid]}» стал супергруппой — сюда больше не пишут; "
-                                     f"подпишись на -100{m.action.channel_id}")
-                if i % DRAIN_EVERY == 0 and not await self.flush(sub):
+            while not sub.dead:
+                msgs = await asyncio.wait_for(self._fetch(pid, sub.sent[pid], oldest=sub.lossless), RPC_TIMEOUT)
+                for i, m in enumerate(sorted(msgs, key=lambda m: m.id), 1):
+                    send(sub.w, msg=prefix + fmt(m, sub.titles[pid]), pid=pid, id=m.id,
+                         sender_id=m.sender_id, sender_is_bot=bool(getattr(m.sender, "bot", False)),
+                         outgoing=bool(m.out), service=getattr(m, "action", None) is not None)
+                    sub.sent[pid] = m.id
+                    if isinstance(getattr(m, "action", None), types.MessageActionChatMigrateTo):
+                        send(sub.w, out=f"tg-watch: «{sub.titles[pid]}» стал супергруппой — сюда больше не пишут; "
+                                         f"подпишись на -100{m.action.channel_id}")
+                    if i % DRAIN_EVERY == 0 and not await self.flush(sub):
+                        return
+                if not await self.flush(sub):
                     return
-            if len(msgs) == CATCH_UP_LIMIT:
-                send(sub.w, out=f"«{sub.titles[pid]}»: новых больше {CATCH_UP_LIMIT}, показаны "
-                                 "последние — остальное: tg read")
-            await self.flush(sub)
+                if len(msgs) < CATCH_UP_LIMIT:
+                    break
+                if not sub.lossless:
+                    send(sub.w, out=f"«{sub.titles[pid]}»: новых больше {CATCH_UP_LIMIT}, показаны "
+                                     "последние — остальное: tg read")
+                    break
 
     async def flush(self, sub: Subscriber) -> bool:
         """drain с таймаутом: зависший подписчик не должен держать свой замок, а с ним — опрос."""
@@ -200,8 +208,8 @@ class Daemon:
         self.drop(sub)
         sub.w.close()
 
-    async def _fetch(self, pid: int, after: int) -> list:
-        return [m async for m in self.client.iter_messages(pid, min_id=after, limit=CATCH_UP_LIMIT)]
+    async def _fetch(self, pid: int, after: int, *, oldest: bool = False) -> list:
+        return [m async for m in self.client.iter_messages(pid, min_id=after, limit=CATCH_UP_LIMIT, reverse=oldest)]
 
     async def on_new(self, event) -> None:
         pid = event.chat_id
@@ -276,9 +284,11 @@ class Daemon:
         await self.wait_ready(None)
         since = {int(k): v for k, v in (a.since or {}).items()}
         sub = Subscriber(w)
+        sub.lossless = bool(getattr(a, "lossless", False))
         self.subs.add(sub)  # сразу: push по уже готовому чату не должен проскочить, пока готовятся остальные
         try:
             catch_up = await asyncio.wait_for(self.watch_setup(sub, a.chats, since), OP_TIMEOUT)
+            send(w, ready={"protocol": 2, "chats": list(sub.titles)})
             send(w, out="tg-watch started: " + ", ".join(f"«{t}» ({p})" for p, t in sub.titles.items())
                  + f"; push + страховочный опрос раз в {POLL}с (демон pid {os.getpid()})")
             await self.flush(sub)
