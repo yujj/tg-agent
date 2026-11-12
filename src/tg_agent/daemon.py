@@ -40,7 +40,9 @@ from .core import (
     bot_upload,
     chat_title,
     ensure_state_dir,
+    ensure_writable,
     fmt,
+    has_account,
     is_numeric_id,
     make_client,
     media_filename,
@@ -362,6 +364,7 @@ class Daemon:
         return sender._transport_connected() if sender else self.client.is_connected()
 
     async def op_send(self, a, out) -> None:
+        ensure_writable("сообщение")
         if a.as_me and not self.transport_up():
             # Без связи запрос встал бы в очередь Telethon и ушёл после переподключения — даже если
             # команда уже отвалилась по таймауту и агент отправил повторно. Отказываем сразу.
@@ -412,6 +415,7 @@ class Daemon:
         out(f"отправлено ботом в «{title}»: #{res['message_id']}{what}")
 
     async def op_react(self, a, out) -> None:
+        ensure_writable("реакцию")
         if a.as_me:
             entity = await resolve(self.client, a.chat, fuzzy=False)
             try:
@@ -442,6 +446,7 @@ class Daemon:
         out(f"реакция {a.emoji} на #{a.msg_id} в «{title}»")
 
     async def op_create_group(self, a, out) -> None:
+        ensure_writable("создание группы")
         # Группу может создать только аккаунт, бот — нет. Как --as-me: только по явной просьбе пользователя.
         if not self.transport_up():
             # Как в send --as-me: без связи запрос уйдёт после переподключения, а повтор команды создаст вторую.
@@ -588,4 +593,9 @@ def run_daemon() -> None:
     lock.truncate(0)
     lock.write(str(os.getpid()))
     lock.flush()
-    asyncio.run(Daemon().run())
+    if has_account():
+        asyncio.run(Daemon().run())
+    else:  # нет tg login (сервер, только бот): читать то, что получает бот
+        from .botmode import BotDaemon
+        log("no account session — bot-only mode")
+        asyncio.run(BotDaemon().run())

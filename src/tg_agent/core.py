@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 import keyring
+import keyring.errors
 from telethon import TelegramClient, utils
 from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
@@ -28,6 +29,9 @@ DAEMON_LOCK = STATE_DIR / "tgd.lock"
 SPAWN_LOCK = STATE_DIR / "spawn.lock"
 CATCH_UP_LIMIT = 200  # больше пропущенного за раз не выдаём — иначе залп в чат агента
 DOWNLOAD_TIMEOUT = 300  # скачать файл — дольше обычной команды (OP_TIMEOUT демона)
+CONFIG_FILE = Path(os.environ.get("TG_AGENT_CONFIG", Path.home() / ".config/tg-agent/config.json")).expanduser()
+# Bot API, которые ничего не меняют в Telegram: всё остальное при read_only — отказ до сети.
+BOT_READ_METHODS = {"getMe", "getWebhookInfo", "getUpdates", "getChat", "getChatMember", "getFile"}
 
 
 class TgError(Exception):
@@ -54,10 +58,65 @@ def ensure_state_dir() -> None:
                       "TG_AGENT_STATE — только в свой каталог (на macOS подойдёт $TMPDIR)")
 
 
+# ---------- настройки ----------
+
+def config() -> dict:
+    """Необязательный config.json (TG_AGENT_CONFIG). Нет файла — {}. Битый — ошибка, а не молча
+    «без ограничений»: read_only должен отказывать наверняка.
+
+    read_only       — true: ничего не отправлять и не менять (ни от бота, ни от аккаунта);
+    bot_token_file  — токен бота из файла (только для владельца), когда keyring нет (сервер);
+    chats           — режим бота: хранить сообщения только этих чатов (числовые id)."""
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        raise TgError(f"настройки {CONFIG_FILE} не читаются ({e})") from e
+    if not isinstance(data, dict) or not isinstance(data.get("read_only", False), bool) \
+            or not isinstance(data.get("bot_token_file", ""), str) \
+            or not all(is_numeric_id(str(c)) for c in data.get("chats", [])):
+        raise TgError(f"настройки {CONFIG_FILE}: read_only — true/false, bot_token_file — путь, chats — числовые id")
+    return data
+
+
+def read_only() -> bool:
+    return config().get("read_only", False)
+
+
+def ensure_writable(what: str) -> None:
+    if read_only():
+        raise TgError(f"только чтение (read_only в {CONFIG_FILE}): {what} не отправляю")
+
+
 # ---------- секреты ----------
 
+def _keyring_get(name: str) -> str | None:
+    try:
+        return keyring.get_password(SERVICE, name)
+    except keyring.errors.KeyringError:  # на сервере без графической сессии бэкенда нет — значит, секрета нет
+        return None
+
+
+def has_account() -> bool:
+    """Вход аккаунтом есть (tg login). Нет — демон работает от бота."""
+    return bool(_keyring_get("session") and _keyring_get("api_id") and _keyring_get("api_hash"))
+
+
 def secret(name: str) -> str:
-    value = keyring.get_password(SERVICE, name)
+    path = config().get("bot_token_file") if name == "bot_token" else None
+    if path:
+        file = Path(path).expanduser()
+        try:
+            if file.stat().st_mode & 0o077:
+                raise TgError(f"файл токена {file} доступен другим — нужен chmod 600")
+            value = file.read_text().strip()
+        except OSError as e:
+            raise TgError(f"файл токена бота {file} не читается ({type(e).__name__})") from e
+        if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", value):
+            raise TgError(f"в {file} не токен бота")
+        return value
+    value = _keyring_get(name)
     if not value:
         hint = {"api_id": "tg setup-api", "api_hash": "tg setup-api",
                 "session": "tg login", "bot_token": "tg setup-bot"}[name]
@@ -207,30 +266,56 @@ def fmt(msg: Message, chat: str | None = None) -> str:
     return " ".join(parts)
 
 
-def media_filename(msg: Message) -> str:
+def safe_filename(chat_id: int, msg_id: int, name: str | None, kind: str, ext: str | None) -> str:
     """Имя для скачанного файла: <чат>_<id>_<имя>. Имя выбирает отправитель — от него остаются только
     безопасные знаки, без каталогов; нет имени — по типу (voice.oga, photo.jpg)."""
-    name = Path(msg.file.name or "").name if msg.file else ""
-    name = re.sub(r"[^\w.-]+", "_", name).strip("._")[:100]
+    name = re.sub(r"[^\w.-]+", "_", Path(name or "").name).strip("._")[:100]
     if not name:
-        kind = "voice" if msg.voice else "video_note" if msg.video_note else "photo" if msg.photo else "file"
-        name = kind + (msg.file.ext if msg.file and msg.file.ext else "")
-    return f"{abs(msg.chat_id)}_{msg.id}_{name}"
+        ext = ext if ext and re.fullmatch(r"\.[A-Za-z0-9]{1,8}", ext) else ""
+        name = kind + ext
+    return f"{abs(chat_id)}_{msg_id}_{name}"
+
+
+def media_filename(msg: Message) -> str:
+    kind = "voice" if msg.voice else "video_note" if msg.video_note else "photo" if msg.photo else "file"
+    return safe_filename(msg.chat_id, msg.id, msg.file.name if msg.file else None, kind,
+                         msg.file.ext if msg.file else None)
 
 
 # ---------- Bot API ----------
 
-def bot_api(token: str, method: str, payload: dict | None = None) -> dict:
+def guard_bot(method: str) -> None:
+    if method not in BOT_READ_METHODS:
+        ensure_writable(f"Bot API {method}")
+
+
+def bot_api(token: str, method: str, payload: dict | None = None, *, timeout: float = 30) -> dict:
+    guard_bot(method)
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/{method}",
         data=json.dumps(payload or {}).encode(),
         headers={"Content-Type": "application/json"},
     )
-    return _bot_call(req, method, timeout=30)
+    return _bot_call(req, method, timeout=timeout)
+
+
+def bot_file(token: str, file_path: str) -> bytes:
+    """Содержимое файла по file_path из getFile. В ошибку URL не попадает: в нём токен."""
+    if not re.fullmatch(r"[A-Za-z0-9_./-]+", file_path) or ".." in file_path:
+        raise TgError("Bot API getFile: неожиданный путь к файлу")
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/file/bot{token}/{file_path}",
+                                    timeout=DOWNLOAD_TIMEOUT - 30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        raise TgError(f"Bot API: файл не скачался (HTTP {e.code})") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise TgError(f"Bot API: файл не скачался — нет связи с api.telegram.org ({type(e).__name__})") from None
 
 
 def bot_upload(token: str, method: str, fields: dict, file_field: str, path: Path) -> dict:
     """Bot API с файлом: multipart/form-data. Вложенные поля (reply_parameters) — JSON-строкой."""
+    guard_bot(method)
     boundary = uuid.uuid4().hex
     parts = []
     for k, v in fields.items():
