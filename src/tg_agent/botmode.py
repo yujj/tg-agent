@@ -218,10 +218,11 @@ class BotDaemon(Daemon):
         delay = 2
         while not self.stop.is_set():
             try:
-                updates = await asyncio.to_thread(lambda: bot_api(
+                # Evaluate SQLite-backed arguments on the event-loop thread; only HTTP runs in a worker.
+                updates = await asyncio.to_thread(bot_api,
                     secret("bot_token"), "getUpdates",
                     {"offset": get_meta(self.db, "offset", 0), "timeout": LONG_POLL, "allowed_updates": UPDATE_KINDS},
-                    timeout=LONG_POLL + 15))
+                    timeout=LONG_POLL + 15)
                 stored = ingest(self.db, updates, self.allowed())
                 self.last_poll = time.time()
                 if self.poll_error:

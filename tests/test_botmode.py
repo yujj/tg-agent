@@ -62,6 +62,28 @@ class Base(unittest.TestCase):
 
 
 class StoreTests(Base):
+    def test_poll_loop_uses_durable_offset_without_crossing_sqlite_threads(self):
+        botmode.ingest(self.daemon.db, [update(6, 11)], None)
+
+        async def scenario():
+            async def pushed(messages):
+                self.assertEqual([m["message_id"] for m in messages], [12])
+                self.daemon.stop.set()
+
+            async def retry(delay):
+                self.fail(f"poll failed before delivery: {self.daemon.poll_error}")
+
+            with patch.object(botmode, "bot_api", return_value=[update(7, 12)]) as api, \
+                    patch.object(self.daemon, "push", side_effect=pushed), \
+                    patch.object(botmode.asyncio, "sleep", side_effect=retry):
+                await asyncio.wait_for(self.daemon.poll_loop(), timeout=2)
+                self.assertEqual(api.call_count, 1)
+                self.assertEqual(api.call_args.args[2]["offset"], 7)
+            self.assertEqual(botmode.get_meta(self.daemon.db, "offset"), 8)
+            self.assertIsNone(self.daemon.poll_error)
+
+        asyncio.run(scenario())
+
     def test_replayed_updates_are_stored_once_and_offset_moves(self):
         db = self.daemon.db
         self.assertEqual(len(botmode.ingest(db, [update(7, 12)], None)), 1)
