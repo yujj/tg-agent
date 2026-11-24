@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -7,8 +8,9 @@ import unittest
 from unittest.mock import AsyncMock, patch
 import uuid
 
-from tg_agent.codex_desktop import Desktop, DeliveryError
-from tg_agent.codex_watch import Store, deliver_once
+from tg_agent.codex_queue import DeliveryError
+from tg_agent import codex_queue
+from tg_agent.codex_watch import Store, deliver_once, handle
 from tg_agent.daemon import Daemon, Subscriber
 
 
@@ -61,33 +63,55 @@ class QueueTests(unittest.TestCase):
             with self.assertRaises(Exception): self.store.ingest(packet)
         self.assertEqual(self.store.positions(), {'-1001': 10})
 
-    def test_delivery_receipt_marks_transport_only_once(self):
+    def test_queue_acceptance_and_local_receive_are_separate(self):
         self.store.ingest(self.message())
-        seen = []
-        class Receiver:
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
-            def deliver(self, identity, event, text, **kwargs):
-                seen.append((identity, text, kwargs))
-                return {'turn': {'id': 'received-turn'}}
-        self.assertTrue(deliver_once(self.store, Receiver))
-        self.store.ingest(self.message())
-        self.assertFalse(deliver_once(self.store, lambda: self.fail('duplicate delivery')))
-        self.assertEqual(self.store.status()['events'], {'delivered': 1})
-        self.assertEqual(seen[0][2], {'name': 'telegram_event', 'source': 'tg-agent'})
+        seen=[]
+        self.assertTrue(deliver_once(self.store, seen.append))
+        self.assertEqual(seen,[self.identity])
+        self.assertEqual(self.store.status()['events'],{'accepted':1})
+        self.assertFalse(deliver_once(self.store,lambda _:self.fail('duplicate notice')))
+        self.store.received(self.store.receivable())
+        self.assertEqual(self.store.status()['events'],{'delivered':1})
 
-    def test_unknown_delivery_pauses_following_events_until_inspected(self):
-        event = self.store.ingest(self.message())
-        class Unknown:
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
-            def deliver(self, *args, **kwargs): raise DeliveryError('timeout', uncertain=True)
-        self.assertFalse(deliver_once(self.store, Unknown))
+    def test_messages_accumulate_behind_one_notification(self):
+        self.store.ingest(self.message())
+        seen=[];deliver_once(self.store,seen.append)
+        self.store.ingest(self.message(12));self.store.ingest(self.message(13))
+        self.assertFalse(deliver_once(self.store,seen.append))
+        self.store.received(self.store.receivable())
+        self.assertTrue(deliver_once(self.store,seen.append))
+        self.assertEqual(len(self.store.receivable()),2)
+        self.assertEqual(len(seen),2)
+
+    def test_early_receive_is_not_downgraded_when_queue_returns(self):
+        self.store.ingest(self.message())
+        def receive_before_return(_):self.store.received(self.store.receivable())
+        self.assertTrue(deliver_once(self.store,receive_before_return))
+        self.assertEqual(self.store.status()['events'],{'delivered':1})
+
+    def test_receive_prints_metadata_from_local_inbox(self):
+        self.store.ingest(self.message());deliver_once(self.store,lambda _:None)
+        with patch('tg_agent.codex_watch.Store',return_value=self.store),patch('tg_agent.codex_watch.ensure_state_dir'),patch('sys.stdout',new_callable=io.StringIO) as out:
+            handle(SimpleNamespace(cmd='codex-receive',thread_id=self.identity))
+            self.assertIn('"sender_id": 22',out.getvalue())
+        self.assertEqual(self.store.status()['events'],{'delivered':1})
+
+    def test_failed_output_is_not_marked_received(self):
+        self.store.ingest(self.message());deliver_once(self.store,lambda _:None)
+        with patch('tg_agent.codex_watch.Store',return_value=self.store),patch('tg_agent.codex_watch.ensure_state_dir'),patch('builtins.print',side_effect=BrokenPipeError):
+            with self.assertRaises(BrokenPipeError):handle(SimpleNamespace(cmd='codex-receive',thread_id=self.identity))
+        self.assertEqual(self.store.status()['events'],{'accepted':1})
+
+    def test_unknown_queue_result_stops_following_notifications(self):
+        event=self.store.ingest(self.message())
+        def unknown(_):raise DeliveryError('timeout',uncertain=True)
+        self.assertFalse(deliver_once(self.store,unknown))
         self.store.ingest(self.message(12))
-        self.assertFalse(deliver_once(self.store, lambda: self.fail('blind retry')))
-        with self.assertRaises(Exception): self.store.resolve(event, 'retry', '')
-        self.store.resolve(event, 'delivered', 'observed in target Codex chat')
-        self.assertEqual(len(self.store.claim()), 1)
+        self.assertFalse(deliver_once(self.store,lambda _:self.fail('blind retry')))
+        with self.assertRaises(Exception):self.store.resolve(event,'retry','')
+        self.store.resolve(event,'delivered','notification observed in the correct queue')
+        self.store.received(self.store.receivable())
+        self.assertEqual(len(self.store.claim()),1)
 
     def test_crash_after_claim_is_uncertain_after_restart(self):
         self.store.ingest(self.message()); self.store.claim()
@@ -97,11 +121,9 @@ class QueueTests(unittest.TestCase):
 
     def test_definite_offline_can_retry_without_losing_the_event(self):
         self.store.ingest(self.message())
-        class Offline:
-            def __enter__(self): raise FileNotFoundError('Desktop closed')
-            def __exit__(self, *args): pass
-        self.assertFalse(deliver_once(self.store, Offline))
-        self.assertEqual(self.store.status()['events'], {'pending': 1})
+        def offline(_):raise FileNotFoundError('CLI absent')
+        self.assertFalse(deliver_once(self.store,offline))
+        self.assertEqual(self.store.status()['events'],{'pending':1})
 
     def test_probe_is_not_a_telegram_message(self):
         self.store.enqueue_probe()
@@ -116,31 +138,33 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.store.status()['events'], {'cancelled': 1})
 
 
-class ProtocolTests(unittest.TestCase):
-    def test_idle_fallback_is_untrusted_input(self):
-        identity = str(uuid.uuid4()); calls = []
-        def request(method, params, version, **kwargs):
-            calls.append((method, params, version))
-            if method == 'thread-owner-discovery':
-                return {'handledByClientId': 'owner', 'result': {'supportsUntrustedAppInput': True}}
-            if method == 'thread-follower-steer-turn':
-                raise DeliveryError(f'Cannot steer conversation {identity} because its active turn already ended')
-            return {'result': {'result': {'turn': {'id': 'idle-turn'}}}}
-        desktop = Desktop()
-        with patch.object(desktop, 'request', side_effect=request):
-            result = desktop.deliver(identity, str(uuid.uuid4()), 'external Telegram data', name='telegram_event', source='tg-agent')
-        items = calls[-1][1]['turnStart']['context']['responseItems']
-        self.assertEqual(items[0]['name'], 'untrusted_input')
-        self.assertEqual(json.loads(items[1]['output'][0]['text'])['source'], 'tg-agent')
-        self.assertEqual(result['turn']['id'], 'idle-turn')
-        self.assertNotIn('permissions', calls[-1][1])
+class QueueTransportTests(unittest.TestCase):
+    @patch.dict('os.environ',{'CODEX_APP_RUNTIME_CLI_PATH':'/path with spaces/codex'})
+    @patch('tg_agent.codex_queue.subprocess.run')
+    def test_only_fixed_signal_is_passed_to_the_runtime_cli(self,run):
+        codex_queue.notify('existing-thread')
+        self.assertEqual(run.call_args.args[0],['/path with spaces/codex','queue','--thread','existing-thread','--message',codex_queue.NOTICE])
+        self.assertNotIn('--resume',run.call_args.args[0])
+        self.assertFalse(run.call_args.kwargs.get('shell',False))
 
-    def test_ambiguous_steering_does_not_start_another_turn(self):
-        desktop = Desktop()
-        with patch.object(desktop, 'owner', return_value='owner'), patch.object(desktop, 'request',
-                side_effect=DeliveryError('connection lost', uncertain=True)) as request:
-            with self.assertRaises(DeliveryError): desktop.deliver(str(uuid.uuid4()), 'event', 'data')
-        self.assertEqual(request.call_count, 1)
+    @patch.dict('os.environ',{'CODEX_APP_RUNTIME_CLI_PATH':'/bin/codex'})
+    @patch('tg_agent.codex_queue.subprocess.run')
+    def test_check_requires_queue_thread_and_message(self,run):
+        run.return_value.stdout='queue --thread --message';codex_queue.check_available()
+        run.return_value.stdout='queue --thread'
+        with self.assertRaises(DeliveryError):codex_queue.check_available()
+
+    @patch.dict('os.environ',{'CODEX_APP_RUNTIME_CLI_PATH':'/bin/codex'})
+    @patch('tg_agent.codex_queue.subprocess.run')
+    def test_explicit_rejection_and_lost_reply_are_different(self,run):
+        import subprocess
+        for error,uncertain in [(subprocess.CalledProcessError(2,'codex',stderr=b'bad flag'),False),
+                                (subprocess.CalledProcessError(1,'codex',stderr=b'does not support thread/queue/add; update or restart'),False),
+                                (subprocess.CalledProcessError(1,'codex',stderr=b'connection closed'),True),
+                                (subprocess.TimeoutExpired('codex',15),True)]:
+            run.side_effect=error
+            with self.assertRaises(DeliveryError) as caught:codex_queue.notify('thread')
+            self.assertEqual(caught.exception.uncertain,uncertain)
 
 
 class BacklogTests(unittest.IsolatedAsyncioTestCase):

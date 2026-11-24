@@ -251,7 +251,7 @@ def main() -> None:
     sub.add_parser("setup-bot", help="сохранить токен бота (интерактивно)")
     sub.add_parser("whoami", help="проверить аккаунт и бота")
     sub.add_parser("status", help="состояние демона и подписок")
-    for name in ("codex-watch", "codex-unwatch", "codex-watching", "codex-probe", "codex-resolve"):
+    for name in ("codex-watch", "codex-unwatch", "codex-watching", "codex-probe", "codex-resolve", "codex-receive"):
         p = sub.add_parser(name, help="подписка и доставка событий в текущий Codex Desktop чат")
         p.add_argument("--thread-id", help="по умолчанию CODEX_THREAD_ID текущего чата")
         if name == "codex-watch":

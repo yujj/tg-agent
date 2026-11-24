@@ -16,7 +16,8 @@ import threading
 import time
 import uuid
 
-from .codex_desktop import Desktop, DeliveryError, private_directory, private_file
+from .codex_private import private_directory, private_file
+from .codex_queue import DeliveryError, check_available, notify
 from .core import STATE_DIR, TgError, ensure_state_dir
 
 DIRECTORY = STATE_DIR / "codex"
@@ -66,7 +67,7 @@ class Store:
             db.execute("INSERT OR REPLACE INTO meta VALUES ('config',?)", (json.dumps(cfg),))
             db.execute("INSERT OR REPLACE INTO meta VALUES ('enabled','true')")
             db.execute("INSERT OR REPLACE INTO meta VALUES ('source','\"connecting\"')")
-            for row in db.execute("SELECT id,payload FROM events WHERE status='pending'").fetchall():
+            for row in db.execute("SELECT id,payload FROM events WHERE status IN ('pending','sending','accepted')").fetchall():
                 payload = json.loads(row['payload'])
                 if payload.get('kind') == 'telegram' and payload['chat_id'] not in chats:
                     db.execute("UPDATE events SET status='cancelled' WHERE id=?", (row['id'],))
@@ -117,7 +118,7 @@ class Store:
             return []
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM events WHERE status IN ('sending','uncertain') LIMIT 1").fetchone():
+            if db.execute("SELECT 1 FROM events WHERE status IN ('sending','accepted','uncertain') LIMIT 1").fetchone():
                 return []
             rows = list(db.execute("SELECT * FROM events WHERE status='pending' ORDER BY rowid LIMIT 50"))
             db.executemany("UPDATE events SET status='sending' WHERE id=?", [(r['id'],) for r in rows])
@@ -125,12 +126,23 @@ class Store:
 
     def finish(self, rows, status, detail=None, turn_id=None):
         with self.db() as db:
-            db.executemany("UPDATE events SET status=?,detail=?,turn_id=? WHERE id=?",
+            # receive can win the race with the queue command's return; never downgrade it.
+            db.executemany("UPDATE events SET status=?,detail=?,turn_id=? WHERE id=? AND status='sending'",
                            [(status, detail, turn_id, row['id']) for row in rows])
+
+    def receivable(self):
+        with self.db() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM events WHERE status IN ('sending','accepted') ORDER BY rowid LIMIT 50")]
+
+    def received(self, rows):
+        with self.db() as db:
+            db.executemany("UPDATE events SET status='delivered',detail='received by local CLI' "
+                           "WHERE id=? AND status IN ('sending','accepted')", [(row['id'],) for row in rows])
 
     def recover(self):
         with self.db() as db:
-            db.execute("UPDATE events SET status='uncertain',detail='worker interrupted during IPC' WHERE status='sending'")
+            db.execute("UPDATE events SET status='uncertain',detail='worker interrupted during queue call' WHERE status='sending'")
 
     def resolve(self, event, outcome, reason):
         if outcome not in {'delivered', 'retry'}:
@@ -139,7 +151,7 @@ class Store:
             raise TgError("Укажите --reason после проверки целевого чата; слепой повтор недопустим")
         with self.db() as db:
             count = db.execute("UPDATE events SET status=?,detail=? WHERE id=? AND status='uncertain'",
-                               ('delivered' if outcome == 'delivered' else 'pending', reason, event)).rowcount
+                               ('accepted' if outcome == 'delivered' else 'pending', reason, event)).rowcount
         if count != 1:
             raise TgError("Не найдено событие с неизвестным результатом")
 
@@ -160,9 +172,10 @@ class Store:
         with self.db() as db:
             counts = {row['status']: row['n'] for row in db.execute("SELECT status,COUNT(*) n FROM events GROUP BY status")}
             uncertain = [dict(row) for row in db.execute("SELECT id,detail FROM events WHERE status='uncertain'")]
-        return {"thread_id": self.identity, "enabled": self.get('enabled', False), "worker_running": self.running(),
+        delivery = 'uncertain' if uncertain else 'awaiting receive' if counts.get('accepted') else self.get('delivery', 'ready')
+        return {"thread_id": self.identity, "transport": self.get('transport', 'legacy IPC'), "enabled": self.get('enabled', False), "worker_running": self.running(),
                 "chats": self.get('config', {}).get('chats', []), "source": self.get('source'),
-                "pid": self.get('pid'), "delivery": self.get('delivery'), "events": counts, "uncertain": uncertain}
+                "pid": self.get('pid'), "delivery": delivery, "events": counts, "uncertain": uncertain}
 
 
 def event_text(rows):
@@ -173,25 +186,23 @@ def event_text(rows):
             + json.dumps([json.loads(row['payload']) for row in rows], ensure_ascii=False))
 
 
-def deliver_once(store, factory=Desktop):
+def deliver_once(store, sender=notify):
     rows = store.claim()
     if not rows:
         return False
     try:
-        with factory() as desktop:
-            receipt = desktop.deliver(store.identity, rows[0]['id'], event_text(rows), name='telegram_event', source='tg-agent')
-        turn = receipt['turn']['id']
-        store.finish(rows, 'delivered', turn_id=turn)
+        sender(store.identity)
+        store.finish(rows, 'accepted', detail='codex queue accepted the notification')
         store.set('delivery', 'ready')
         return True
     except DeliveryError as error:
         store.finish(rows, 'uncertain' if error.uncertain else 'pending', str(error))
-        store.set('delivery', 'uncertain' if error.uncertain else 'waiting for Desktop')
+        store.set('delivery', 'uncertain' if error.uncertain else 'waiting for Codex queue')
     except OSError:
-        store.finish(rows, 'pending', 'Desktop unavailable')
-        store.set('delivery', 'waiting for Desktop')
+        store.finish(rows, 'pending', 'Codex CLI unavailable')
+        store.set('delivery', 'waiting for Codex queue')
     except Exception:
-        store.finish(rows, 'uncertain', 'Unexpected delivery outcome; inspect the target Codex chat')
+        store.finish(rows, 'uncertain', 'Unexpected queue outcome; inspect the target Codex chat')
         store.set('delivery', 'uncertain')
     return False
 
@@ -200,6 +211,7 @@ def run_worker(store):
     from .cli import ensure_daemon
     with store.held():
         store.set('pid', os.getpid())
+        store.set('transport', 'codex queue')
         store.recover()
         stop, wake = threading.Event(), threading.Event()
         def deliveries():
@@ -263,7 +275,8 @@ def handle(args):
     if not identity: raise TgError('Нужен CODEX_THREAD_ID текущего чата или явный --thread-id')
     store = Store(identity)
     if args.cmd == 'codex-watch':
-        with Desktop() as desktop: desktop.owner(store.identity)
+        try: check_available()
+        except DeliveryError as error: raise TgError(str(error)) from None
         cfg = store.configure(args.chats, args.ignore_sender, args.after)
         start(store)
         deadline = time.monotonic() + 25
@@ -278,13 +291,20 @@ def handle(args):
     elif args.cmd == 'codex-unwatch':
         store.set('enabled', False)
     elif args.cmd == 'codex-probe':
-        with Desktop() as desktop: desktop.owner(store.identity)
+        try: check_available()
+        except DeliveryError as error: raise TgError(str(error)) from None
         if args.deliver:
             if not store.get('enabled', False): raise TgError('Сначала tg codex-watch')
             event = store.enqueue_probe()
             print(json.dumps({'probe_event_id': event, 'telegram_message_sent': False}))
         else:
-            print(json.dumps({'thread_id': store.identity, 'ipc_ready': True}))
+            print(json.dumps({'thread_id': store.identity, 'transport': 'codex queue', 'queue_ready': True}))
+        return 0
+    elif args.cmd == 'codex-receive':
+        rows = store.receivable()
+        print(event_text(rows) if rows else 'Telegram: новых локальных событий нет.')
+        sys.stdout.flush()
+        store.received(rows)
         return 0
     elif args.cmd == 'codex-resolve':
         store.resolve(args.event_id, args.outcome, args.reason)
